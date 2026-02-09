@@ -1,3 +1,5 @@
+#pragma once
+
 #include "HttpRouter.h"
 
 struct Http3Response;

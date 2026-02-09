@@ -36,7 +36,7 @@ enum CompressFlags : int {
 
 template <bool SSL, bool isServer, typename USERDATA>
 struct WebSocket : AsyncSocket<SSL> {
-    template <bool> friend struct TemplatedApp;
+    template <bool> friend struct TemplatedProtocol;
     template <bool> friend struct HttpResponse;
 private:
     typedef AsyncSocket<SSL> Super;

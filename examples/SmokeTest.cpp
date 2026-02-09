@@ -1,4 +1,4 @@
-#include "App.h"
+#include "akeno/App.h"
 
 /* This is not an example; it is a smoke test used in CI testing */
 

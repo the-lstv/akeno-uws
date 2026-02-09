@@ -1,3 +1,4 @@
+#pragma once
 
 extern "C" {
 #include "quic.h"

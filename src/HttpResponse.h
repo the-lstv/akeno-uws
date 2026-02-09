@@ -22,7 +22,7 @@
 
 #include "AsyncSocket.h"
 #include "HttpResponseData.h"
-#include "HttpContext.h"
+#include "akeno/HttpContext.h"
 #include "HttpContextData.h"
 #include "Utilities.h"
 
@@ -46,7 +46,7 @@ static const int HTTP_TIMEOUT_S = 10;
 template <bool SSL>
 struct HttpResponse : public AsyncSocket<SSL> {
     /* Solely used for getHttpResponseData() */
-    template <bool> friend struct TemplatedApp;
+    template <bool> friend struct TemplatedProtocol;
     typedef AsyncSocket<SSL> Super;
 private:
     HttpResponseData<SSL> *getHttpResponseData() {

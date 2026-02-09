@@ -13,3 +13,6 @@
 [submodule "libdeflate"]
 	path = libdeflate
 	url = https://github.com/ebiggers/libdeflate
+[submodule "src/akeno/external/xxHash"]
+	path = src/akeno/external/xxHash
+	url = https://github.com/Cyan4973/xxHash

@@ -1,7 +1,7 @@
 /* We rely on wrapped syscalls */
 #include "libEpollFuzzer/epoll_fuzzer.h"
 
-#include "App.h"
+#include "akeno/App.h"
 
 /* We keep this one for teardown later on */
 struct us_listen_socket_t *listen_socket;

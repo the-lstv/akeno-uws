@@ -31,7 +31,8 @@ template <bool SSL>
 struct alignas(16) HttpContextData {
     template <bool> friend struct HttpContext;
     template <bool> friend struct HttpResponse;
-    template <bool> friend struct TemplatedApp;
+    friend struct App;
+    template <bool> friend struct TemplatedProtocol;
 private:
     std::vector<MoveOnlyFunction<void(HttpResponse<SSL> *, int)>> filterHandlers;
 
@@ -49,6 +50,9 @@ private:
     HttpRouter<RouterData> router;
     void *upgradedWebSocket = nullptr;
     bool isParsingHttp = false;
+
+    /* Pointer to the Akeno DomainRouter (set by HttpProtocol::setApp) */
+    void *domainRouter = nullptr;
 
     /* If we are main acceptor, distribute to these apps */
     std::vector<void *> childApps;
