@@ -232,9 +232,12 @@ public:
     // This is exposed so that bindings can set it
     bool in_markdown = false;
 
-    void write(std::string_view buf, std::string* _output = nullptr, void* userData = nullptr, std::string rootPath = "") {
+    std::string lastError;
+
+    bool write(std::string_view buf, std::string* _output = nullptr, void* userData = nullptr, std::string rootPath = "") {
         if (options.buffer && _output == nullptr) {
-            throw std::invalid_argument("Output string cannot be undefined when buffer option is enabled.");
+            lastError = "Output string cannot be undefined when buffer option is enabled.";
+            return false;
         }
 
         if (_output) {
@@ -253,6 +256,7 @@ public:
 
         cacheEntry = nullptr;
         resume();
+        return true;
     }
 
     bool needsUpdate(std::string filePath) {
@@ -261,8 +265,11 @@ public:
             return true;
         }
 
-        if (!std::filesystem::exists(filePath)) return true;
-        auto fileModTime = std::filesystem::last_write_time(filePath);
+        std::error_code ec;
+        if (!std::filesystem::exists(filePath, ec)) return true;
+        auto fileModTime = std::filesystem::last_write_time(filePath, ec);
+        if (ec) return true;
+
         if (cacheIt->second->lastModified != fileModTime) {
             return true;
         }
@@ -271,8 +278,10 @@ public:
         // NOTE: Make sure it gets handled if the template gets deleted
         if (cacheIt->second->templateCache != nullptr) {
             const auto& tmpl = cacheIt->second->templateCache;
-            if (!std::filesystem::exists(tmpl->path)) return true;
-            auto templateModTime = std::filesystem::last_write_time(tmpl->path);
+            if (!std::filesystem::exists(tmpl->path, ec)) return true;
+            auto templateModTime = std::filesystem::last_write_time(tmpl->path, ec);
+            if (ec) return true;
+
             if (cacheIt->second->templateLastModified != templateModTime) {
                 return true;
             }
@@ -347,12 +356,19 @@ public:
         return result + "</html>";
     }
 
-    FileCache& fromFile(std::string filePath, void* userData = nullptr, std::string rootPath = "", bool checkCache = true) {
+    FileCache* fromFile(std::string filePath, void* userData = nullptr, std::string rootPath = "", bool checkCache = true) {
         filePath = std::filesystem::path(filePath).lexically_normal().string();
-        if (!std::filesystem::exists(filePath)) {
-            throw std::runtime_error("Unable to open file: " + filePath);
+        std::error_code ec;
+        if (!std::filesystem::exists(filePath, ec)) {
+            lastError = "Unable to open file: " + filePath;
+            return nullptr;
         }
-        auto fileModTime = std::filesystem::last_write_time(filePath);
+        auto fileModTime = std::filesystem::last_write_time(filePath, ec);
+        if (ec) {
+            lastError = "Unable to get file modification time: " + filePath;
+            return nullptr;
+        }
+        
         bool contentCached = true;
         bool templateCached = true;
 
@@ -361,21 +377,22 @@ public:
             contentCached = cacheIt != fileCache.end() && cacheIt->second->lastModified == fileModTime;
 
             if (contentCached && cacheIt->second->templateCache != nullptr) {
-                auto templateModTime = std::filesystem::last_write_time(cacheIt->second->templateCache->path);
-                if (cacheIt->second->templateLastModified != templateModTime) {
-                    cacheIt->second->templateLastModified = templateModTime;
+                auto templateModTime = std::filesystem::last_write_time(cacheIt->second->templateCache->path, ec);
+                
+                if (ec || cacheIt->second->templateLastModified != templateModTime) {
+                    if (!ec) cacheIt->second->templateLastModified = templateModTime;
                     templateCached = false;
 
                     if (contentCached) {
-                        fromFile(cacheIt->second->templateCache->path, userData, rootPath);
-                        return *cacheIt->second;
+                        if (fromFile(cacheIt->second->templateCache->path, userData, rootPath) == nullptr) return nullptr;
+                        return cacheIt->second.get();
                     }
                 }
             }
 
             if (contentCached && templateCached) {
                 cacheEntry = cacheIt->second;
-                return *cacheIt->second;
+                return cacheIt->second.get();
             }
         }
 
@@ -390,23 +407,26 @@ public:
 
         std::ifstream file(filePath, std::ios::in | std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
-            throw std::runtime_error("Unable to open file: " + filePath);
+            lastError = "Unable to open file: " + filePath;
+            return nullptr;
         }
 
         std::streamsize size = file.tellg();
         if (size > MAX_FILE_SIZE) {
-            throw std::runtime_error("File size exceeds the maximum limit of " + std::to_string(MAX_FILE_SIZE) + " bytes.");
+            lastError = "File size exceeds the maximum limit of " + std::to_string(MAX_FILE_SIZE) + " bytes.";
+            return nullptr;
         }
 
         if(size == 0) {
             cacheEntry->content.clear();
-            return *cacheEntry;
+            return cacheEntry.get();
         }
 
         file.seekg(0, std::ios::beg);
         std::vector<char> fileBuffer(size);
         if (!file.read(fileBuffer.data(), size)) {
-            throw std::runtime_error("Error reading file: " + filePath);
+            lastError = "Error reading file: " + filePath;
+            return nullptr;
         }
 
         std::string_view fileContent(fileBuffer.data(), fileBuffer.size());
@@ -421,7 +441,7 @@ public:
 
         resume();
         end();
-        return *cacheEntry;
+        return cacheEntry.get();
     }
 
     void end() {
@@ -1567,19 +1587,19 @@ public:
                             if (template_enabled && !modifierValue.empty() && cacheEntry) {
                                 std::string templateFile = rootPath + std::string(modifierValue);
     
-                                try {
-                                    ParsingState oldState = captureState();
-                                    HTMLParsingPosition originalPosition = storePosition();
-                                    
-                                    FileCache& templateCacheEntry = fromFile(templateFile, userData, rootPath);
-                                    
-                                    restorePosition(originalPosition);
-                                    restoreState(oldState);
-                                    
-                                    cacheEntry->templateLastModified = templateCacheEntry.lastModified;
-                                    cacheEntry->templateCache = fileCache[templateCacheEntry.path];
-                                } catch (const std::filesystem::filesystem_error& e) {
-                                    std::cerr << "Error accessing template file: " << e.what() << std::endl;
+                                ParsingState oldState = captureState();
+                                HTMLParsingPosition originalPosition = storePosition();
+                                
+                                FileCache* templateCacheEntry = fromFile(templateFile, userData, rootPath);
+
+                                restorePosition(originalPosition);
+                                restoreState(oldState);
+                                
+                                if (templateCacheEntry) {
+                                    cacheEntry->templateLastModified = templateCacheEntry->lastModified;
+                                    cacheEntry->templateCache = fileCache[templateCacheEntry->path];
+                                } else {
+                                    std::cerr << "Error accessing template file: " << lastError << std::endl;
                                 }
     
                                // if (cacheEntry->templateChunkSplit > 0) {
@@ -1610,21 +1630,24 @@ public:
      * Inline a file into the current parsing location, treating it as if it were part of the current context.
      * Be cautious with this, as the state does not get reset.
      */
-    void inlineFile(std::string filePath) {
+    bool inlineFile(std::string filePath) {
         std::ifstream file(filePath, std::ios::in | std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
-            throw std::runtime_error("Failed to open file: " + filePath);
+            lastError = "Failed to open file: " + filePath;
+            return false;
         }
 
         std::streamsize size = file.tellg();
         if (size > MAX_FILE_SIZE) {
-            throw std::runtime_error("File size exceeds maximum allowed size: " + filePath);
+            lastError = "File size exceeds maximum allowed size: " + filePath;
+            return false;
         }
 
         file.seekg(0, std::ios::beg);
         std::vector<char> buffer(size);
         if (!file.read(buffer.data(), size)) {
-            throw std::runtime_error("Failed to read file: " + filePath);
+            lastError = "Failed to read file: " + filePath;
+            return false;
         }
 
         std::string_view fileContent(buffer.data(), size);
@@ -1634,6 +1657,7 @@ public:
         restorePosition(newPos);
         resume();
         restorePosition(pos);
+        return true;
     }
 
     std::stack<std::string_view> tagStack;
@@ -1868,9 +1892,7 @@ private:
             std::string file = pending_import_file;
             pending_import_file.clear(); // Clear it before recursion
             
-            try {
-                inlineFile(file);
-            } catch(...) {}
+            inlineFile(file);
         }
     }
 

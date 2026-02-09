@@ -65,7 +65,8 @@ namespace Akeno {
                 if (prevChar != '!') {
                     size_t endGroup = pattern.find('}', group);
                     if (endGroup == std::string::npos) {
-                        throw std::runtime_error("Unmatched group in pattern: " + pattern);
+                        // throw std::runtime_error("Unmatched group in pattern: " + pattern);
+                        return;
                     }
 
                     std::string groupValues = pattern.substr(group + 1, endGroup - group - 1);
