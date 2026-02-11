@@ -175,6 +175,7 @@ private:
 
                 /* SNI fast-path for SSL: try exact-match us_socket_server_name_userdata first */
                 /* This way we can possibly skip standard domain routing */
+                /* TODO: Not working yet */
                 DomainHandler *sniHandler = nullptr;
                 if constexpr (SSL) {
                     void *sniUserdata = us_socket_server_name_userdata(1, (struct us_socket_t *) s);
@@ -219,7 +220,7 @@ private:
                     }
                 }
 
-                std::cout << "Received request for domain: " << domain << " with path: " << url << std::endl;
+                // std::cout << "Received request for domain: " << domain << " with path: " << url << std::endl;
 
                 /* Route via domain router (fallback from SNI or for non-SSL) */
                 /* This is always the case for wildcards */
@@ -244,20 +245,19 @@ private:
                     return nullptr;
                 }
 
-                if (resolved->kind == DomainHandler::Kind::Callback && resolved->callback) {
-                    resolved->callback((HttpResponse<false> *) res, httpRequest);
-                    return nullptr;
-                }
-
-                if (resolved->kind == DomainHandler::Kind::StaticBuffer && resolved->staticBuffer) {
-                    res->end(std::string_view(resolved->staticBuffer->data(), resolved->staticBuffer->size()));
-                    return nullptr;
+                if (resolved->kind == DomainHandler::Kind::Callback && resolved->hasCallback<SSL>()) {
+                    resolved->invokeCallback<SSL>((HttpResponse<SSL> *) res, httpRequest);
+                } else {
+                    if (resolved->kind == DomainHandler::Kind::StaticBuffer && resolved->staticBuffer) {
+                        res->end(std::string_view(resolved->staticBuffer->data(), resolved->staticBuffer->size()));
+                        return nullptr;
+                    }                    
                 }
 
                 if (httpContextData->upgradedWebSocket || us_socket_is_closed(SSL, (struct us_socket_t *) s) || us_socket_is_shut_down(SSL, (us_socket_t *) s)) {
                     return nullptr;
                 }
-
+                
                 if (!((HttpResponse<SSL> *) s)->hasResponded() && !httpResponseData->onAborted) {
                     std::cerr << "Error: Returning from a request handler without responding or attaching an abort handler is forbidden!"
                               << std::endl

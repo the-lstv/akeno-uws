@@ -631,7 +631,7 @@ public:
 
 namespace uWS {
     typedef uWS::TemplatedProtocol<false> HTTPProtocol;
-    typedef uWS::TemplatedProtocol<true> SSLProtocol;
+    typedef uWS::TemplatedProtocol<true> HTTPSProtocol;
 }
 
 #endif // UWS_APP_H

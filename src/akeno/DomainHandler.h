@@ -25,7 +25,13 @@ struct DomainHandler {
         Custom
     } kind = Kind::None;
 
-    uWS::MoveOnlyFunction<void(uWS::HttpResponse<false> *, uWS::HttpRequest *)> callback;
+    // This thing is a bit clumsy but sadly there is no simpler way to have both HTTP and HTTPS via one route in C++
+    // Don't get me started on H3
+
+    // Store both HTTP and HTTPS callbacks for protocol-agnostic routing
+    uWS::MoveOnlyFunction<void(uWS::HttpResponse<false> *, uWS::HttpRequest *)> callbackHttp;
+    uWS::MoveOnlyFunction<void(uWS::HttpResponse<true> *, uWS::HttpRequest *)> callbackHttps;
+    
     std::shared_ptr<Akeno::PathMatcher<DomainHandler>> pathMatcher;
     std::shared_ptr<std::string> staticBuffer;
     std::shared_ptr<v8::Global<v8::Object>> jsObject;
@@ -34,13 +40,77 @@ struct DomainHandler {
     // TODO: Add request type filtering
 
     /**
+     * Invoke the appropriate callback based on SSL template parameter.
+     */
+    template <bool SSL>
+    void invokeCallback(uWS::HttpResponse<SSL> *res, uWS::HttpRequest *req) {
+        if constexpr (SSL) {
+            if (callbackHttps) {
+                callbackHttps(res, req);
+            }
+        } else {
+            if (callbackHttp) {
+                callbackHttp(res, req);
+            }
+        }
+    }
+
+    /**
+     * Check if a callback exists for the given protocol.
+     */
+    template <bool SSL>
+    bool hasCallback() {
+        if constexpr (SSL) {
+            return (bool)callbackHttps;
+        } else {
+            return (bool)callbackHttp;
+        }
+    }
+
+    /**
      * Note; both Callback and any other type (can) be registered, callback is always first.
      * Whether it should depends on you
      */
-    static DomainHandler onRequest(uWS::MoveOnlyFunction<void(uWS::HttpResponse<false> *, uWS::HttpRequest *)> &&handler) { // TODO: Handle SSL cases (will need to do it differently as routers are now protocol agnostic)
+    template <bool SSL>
+    static DomainHandler onRequest(uWS::MoveOnlyFunction<void(uWS::HttpResponse<SSL> *, uWS::HttpRequest *)> &&handler) {
         DomainHandler h;
         h.kind = Kind::Callback;
-        h.callback = std::move(handler);
+        if constexpr (SSL) {
+            h.callbackHttps = std::move(handler);
+        } else {
+            h.callbackHttp = std::move(handler);
+        }
+        return h;
+    }
+
+    /**
+     * Create a handler that works with both HTTP and HTTPS by providing both callbacks.
+     */
+    static DomainHandler onRequestBoth(
+        uWS::MoveOnlyFunction<void(uWS::HttpResponse<false> *, uWS::HttpRequest *)> &&httpHandler,
+        uWS::MoveOnlyFunction<void(uWS::HttpResponse<true> *, uWS::HttpRequest *)> &&httpsHandler
+    ) {
+        DomainHandler h;
+        h.kind = Kind::Callback;
+        h.callbackHttp = std::move(httpHandler);
+        h.callbackHttps = std::move(httpsHandler);
+        return h;
+    }
+
+    /**
+     * Create a unified handler from a template function (preferred for protocol-agnostic handlers).
+     * Usage: DomainHandler::onRequestUnified<MyHandler>()
+     */
+    template <auto HandlerFunc>
+    static DomainHandler onRequestUnified() {
+        DomainHandler h;
+        h.kind = Kind::Callback;
+        h.callbackHttp = [](uWS::HttpResponse<false> *res, uWS::HttpRequest *req) {
+            HandlerFunc(res, req);
+        };
+        h.callbackHttps = [](uWS::HttpResponse<true> *res, uWS::HttpRequest *req) {
+            HandlerFunc(res, req);
+        };
         return h;
     }
 
