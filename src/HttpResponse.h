@@ -33,6 +33,14 @@
 
 #include "MoveOnlyFunction.h"
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#else
+#include <io.h>
+#include <sys/stat.h>
+#endif
+
 /* todo: tryWrite is missing currently, only send smaller segments with write */
 
 namespace uWS {
@@ -51,6 +59,100 @@ struct HttpResponse : public AsyncSocket<SSL> {
 private:
     HttpResponseData<SSL> *getHttpResponseData() {
         return (HttpResponseData<SSL> *) Super::getAsyncSocketData();
+    }
+
+    struct StreamFileState {
+        int fd;
+        uintmax_t totalSize;
+        size_t chunkSize;
+        bool closeWhenDone;
+        bool cleaned;
+        char *buffer;
+        MoveOnlyFunction<void()> onAbort;
+    };
+
+#ifdef _WIN32
+    using StreamReadSize = int;
+    static StreamReadSize streamFileReadAt(int fd, void *buffer, size_t length, uintmax_t offset) {
+        if (_lseeki64(fd, (long long) offset, SEEK_SET) < 0) {
+            return -1;
+        }
+        return _read(fd, buffer, (unsigned int) length);
+    }
+
+    static bool streamFileStat(int fd, uintmax_t *sizeOut) {
+        struct _stat64 st;
+        if (_fstat64(fd, &st) != 0) {
+            return false;
+        }
+        *sizeOut = (uintmax_t) st.st_size;
+        return true;
+    }
+
+    static void streamFileClose(int fd) {
+        _close(fd);
+    }
+#else
+    using StreamReadSize = ssize_t;
+    static StreamReadSize streamFileReadAt(int fd, void *buffer, size_t length, uintmax_t offset) {
+        return pread(fd, buffer, length, (off_t) offset);
+    }
+
+    static bool streamFileStat(int fd, uintmax_t *sizeOut) {
+        struct stat st;
+        if (fstat(fd, &st) != 0) {
+            return false;
+        }
+        *sizeOut = (uintmax_t) st.st_size;
+        return true;
+    }
+
+    static void streamFileClose(int fd) {
+        ::close(fd);
+    }
+#endif
+
+    static void streamFileCleanup(StreamFileState *state) {
+        if (!state || state->cleaned) {
+            return;
+        }
+        state->cleaned = true;
+        if (state->closeWhenDone) {
+            streamFileClose(state->fd);
+        }
+        delete[] state->buffer;
+        delete state;
+    }
+
+    static bool streamFilePump(HttpResponse *res, StreamFileState *state) {
+        while (true) {
+            uintmax_t offset = res->getWriteOffset();
+            if (offset >= state->totalSize) {
+                streamFileCleanup(state);
+                return true;
+            }
+
+            size_t toRead = (size_t) std::min<uintmax_t>(state->chunkSize, state->totalSize - offset);
+            StreamReadSize readBytes = streamFileReadAt(state->fd, state->buffer, toRead, offset);
+            if (readBytes <= 0) {
+                streamFileCleanup(state);
+                res->close();
+                return false;
+            }
+
+            auto [ok, responded] = res->tryEnd({state->buffer, (size_t) readBytes}, state->totalSize);
+            if (responded) {
+                streamFileCleanup(state);
+                return ok;
+            }
+
+            if (!ok) {
+                res->onWritable([res, state](uintmax_t) {
+                    return streamFilePump(res, state);
+                });
+                return false;
+            }
+        }
     }
 
     /* Write an unsigned 32-bit integer in hex */
@@ -441,6 +543,48 @@ public:
     std::pair<bool, bool> tryEnd(std::string_view data, uintmax_t totalSize = 0, bool closeConnection = false) {
         bool ok = internalEnd(data, totalSize, true, true, closeConnection);
         return {ok, hasResponded()};
+    }
+
+    /* Stream a file from a file descriptor with backpressure and abort handling. */
+    void streamFile(int fd, bool closeWhenDone = true, MoveOnlyFunction<void()> &&onAbort = nullptr) {
+        uintmax_t totalSize = 0;
+        if (!streamFileStat(fd, &totalSize)) {
+            return;
+        }
+
+        if (!totalSize) {
+            end();
+            if (closeWhenDone) {
+                streamFileClose(fd);
+            }
+            return;
+        }
+
+        static constexpr size_t chunkSize = 256 * 1024;
+        auto *state = new StreamFileState{
+            fd,
+            totalSize,
+            chunkSize,
+            closeWhenDone,
+            false,
+            new char[chunkSize],
+            std::move(onAbort)
+        };
+
+        HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
+        MoveOnlyFunction<void()> previousOnAborted = std::move(httpResponseData->onAborted);
+
+        httpResponseData->onAborted = [state, previous = std::move(previousOnAborted)]() mutable {
+            if (previous) {
+                previous();
+            }
+            if (state->onAbort) {
+                state->onAbort();
+            }
+            streamFileCleanup(state);
+        };
+
+        streamFilePump(this, state);
     }
 
     /* Write parts of the response in chunking fashion. Starts timeout if failed. */
