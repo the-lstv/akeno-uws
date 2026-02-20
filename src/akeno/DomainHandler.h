@@ -1,5 +1,4 @@
-#ifndef AKENO_DOMAIN_HANDLER_H
-#define AKENO_DOMAIN_HANDLER_H
+#pragma once
 
 #include <v8.h>
 #include "akeno/Router.h"
@@ -13,15 +12,19 @@ namespace uWS {
     struct HttpRequest;
 }
 
+namespace Akeno {
+    class WebApp;
+}
+
 using namespace v8;
 
 struct DomainHandler {
     enum class Kind : uint8_t {
         None,
         PathMatcher,
-        JsObject,
         Callback,
         StaticBuffer,
+        WebApp,
         Custom
     } kind = Kind::None;
 
@@ -34,7 +37,7 @@ struct DomainHandler {
     
     std::shared_ptr<Akeno::PathMatcher<DomainHandler>> pathMatcher;
     std::shared_ptr<std::string> staticBuffer;
-    std::shared_ptr<v8::Global<v8::Object>> jsObject;
+    std::shared_ptr<Akeno::WebApp> webApp;
     std::shared_ptr<void> customData;
 
     // TODO: Add request type filtering
@@ -121,16 +124,15 @@ struct DomainHandler {
         return h;
     }
 
-    static DomainHandler fromPathMatcher(Akeno::PathMatcher<DomainHandler> *matcher) {
-        return fromPathMatcher(std::shared_ptr<Akeno::PathMatcher<DomainHandler>>(matcher, [](auto *) {}));
+    static DomainHandler fromWebApp(std::shared_ptr<Akeno::WebApp> webApp) {
+        DomainHandler h;
+        h.kind = Kind::WebApp; // Using Custom kind for WebApp to avoid adding a new enum value, can be changed if needed
+        h.webApp = std::move(webApp);
+        return h;
     }
 
-    static DomainHandler fromJsObject(Isolate *isolate, Local<Object> obj) {
-        DomainHandler h;
-        h.kind = Kind::JsObject;
-        h.jsObject = std::make_shared<v8::Global<v8::Object>>();
-        h.jsObject->Reset(isolate, obj);
-        return h;
+    static DomainHandler fromPathMatcher(Akeno::PathMatcher<DomainHandler> *matcher) {
+        return fromPathMatcher(std::shared_ptr<Akeno::PathMatcher<DomainHandler>>(matcher, [](auto *) {}));
     }
 
     static DomainHandler fromStaticBuffer(std::string buffer) {
@@ -155,12 +157,12 @@ struct DomainHandler {
                 return true;
             case Kind::PathMatcher:
                 return pathMatcher == other.pathMatcher;
-            case Kind::JsObject:
-                return jsObject == other.jsObject;
             case Kind::Callback:
                 return false; // MoveOnlyFunction cannot be compared (TODO: Idk probably)
             case Kind::StaticBuffer:
                 return staticBuffer == other.staticBuffer;
+            case Kind::WebApp:
+                return webApp == other.webApp;
             case Kind::Custom:
                 return customData == other.customData;
         }
@@ -192,5 +194,3 @@ inline DomainHandler *resolveDomainHandler(DomainHandler *handler, std::string_v
 inline const DomainHandler *resolveDomainHandler(const DomainHandler *handler, std::string_view path) {
     return resolveDomainHandler(const_cast<DomainHandler *>(handler), path);
 }
-
-#endif // AKENO_DOMAIN_HANDLER_H

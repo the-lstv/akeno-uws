@@ -11,8 +11,11 @@
     Warning: this is a prototype implementation and not production-ready code.
 */
 
-#ifndef AKENO_ROUTER_H
-#define AKENO_ROUTER_H
+#pragma once
+
+#ifndef AKENO_VERSION
+#define AKENO_VERSION "2.0.0-cpp"
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -21,13 +24,14 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_map>
+#include <akeno/external/ankerl/unordered_dense.h>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 #include <stdexcept>
 #include <cstdint>
 #include <limits>
+#include <iostream>
 
 namespace Akeno {
 
@@ -497,7 +501,7 @@ namespace Akeno {
         struct SizeGroup {
             size_t size = 0;
             bool hasAnyDoubleStar = false;
-            std::unordered_map<std::string, std::vector<const Route *>> literalFirst;
+            ankerl::unordered_dense::map<std::string, std::vector<const Route *>> literalFirst;
             std::vector<const Route *> nonLiteral;
         };
 
@@ -509,7 +513,7 @@ namespace Akeno {
                 return;
 
             sizeGroups_.clear();
-            std::unordered_map<size_t, size_t> sizeToIndex;
+            ankerl::unordered_dense::map<size_t, size_t> sizeToIndex;
 
             for (const auto &route : patterns_) {
                 size_t sz = route.parts.size();
@@ -660,7 +664,6 @@ namespace Akeno {
         }
 
         void add(std::string pattern, Handler handler) {
-
             if (!pattern.empty() && pattern.back() == '.') {
                 pattern.pop_back();
             }
@@ -740,12 +743,10 @@ namespace Akeno {
         }
 
         const Handler *match(std::string_view input) const {
-            /* 1. Exact match (fast path) */
-            if (auto it = exactSlots_.find(input); it != exactSlots_.end()) {
+            if (auto it = exactSlots_.find(std::string(input)); it != exactSlots_.end()) {
                 return store_.get(it->second);
             }
 
-            /* 2. Wildcard match */
             uint32_t slot = INVALID_SLOT;
             if (options_.simpleMatcher) {
                 slot = simpleWildcards_.matchSlot(input);
@@ -756,7 +757,6 @@ namespace Akeno {
                 return store_.get(slot);
             }
 
-            /* 3. Fallback */
             if (fallbackSlot_ != INVALID_SLOT) {
                 return store_.get(fallbackSlot_);
             }
@@ -772,7 +772,7 @@ namespace Akeno {
         char segmentChar_;
 
         HandlerStore<Handler> store_;
-        std::map<std::string, uint32_t, std::less<>> exactSlots_;
+        ankerl::unordered_dense::map<std::string, uint32_t> exactSlots_;
 
         WildcardMatcher wildcards_;
         SimpleWildcardMatcher simpleWildcards_;
@@ -841,26 +841,29 @@ namespace Akeno {
         "</style>";
 
     static inline constexpr std::string_view kDefaultErrorPageTail =
-        "<hr><footer>Powered by <a href=\"https://github.com/the-lstv/akeno\" target=\"_blank\">Akeno/1.6.9-beta</a></footer></html>";
+        "<hr><footer>Powered by <a href=\"https://github.com/the-lstv/akeno\" target=\"_blank\">Akeno/" AKENO_VERSION "</a></footer></html>";
 
     inline std::string errorPageHead = std::string(kDefaultErrorPageHead);
     inline std::string errorPageTail = std::string(kDefaultErrorPageTail);
 
-    inline std::string defaultErrorMessageForStatus(std::string_view status) {
+    inline std::string_view defaultErrorMessageForStatus(std::string_view status) {
         if (status.rfind("404", 0) == 0) {
-            return "The requested page could not be found on this server.";
+            return "The requested page could not be found.";
         }
-
-        if (status.rfind("200", 0) == 0) {
-            return "Wait, what?";
-        }
-
         if (status.rfind("401", 0) == 0) {
             return "You are not authorized to access this page.";
         }
 
         if (status.rfind("403", 0) == 0) {
             return "You do not have permission to access this page.";
+        }
+
+        if (status.rfind("400", 0) == 0) {
+            return "The request was malformed.";
+        }
+
+        if (status.rfind("200", 0) == 0) {
+            return "We failed successfully";
         }
 
         if (status.rfind("418", 0) == 0) {
@@ -901,52 +904,69 @@ namespace Akeno {
             return;
         }
 
-        std::string statusStr(status.empty() ? "500" : std::string(status));
-        if (statusStr.empty()) {
-            statusStr = "500";
+        if (status.empty()) {
+            status = "500";
         }
 
-        std::string messageStr;
-        if (!message.empty()) {
-            messageStr.assign(message.data(), message.size());
-        } else {
-            messageStr = defaultErrorMessageForStatus(statusStr);
-        }
-
-        std::string titleStr;
-        if (!title.empty()) {
-            titleStr.assign(title.data(), title.size());
-        } else {
-            titleStr = statusStr.empty() ? "Internal Server Error" : statusStr;
-        }
-
-        std::string messageData;
-        messageData.reserve(titleStr.size() + messageStr.size() + 20);
-        messageData.append("<h2>");
-        messageData.append(titleStr);
-        messageData.append("</h2><p>");
-        messageData.append(messageStr);
-        messageData.append("</p>");
-
-        std::string_view headView = errorPageHead;
-        std::string_view tailView = errorPageTail;
-
-        if constexpr (!HasCork<Res>) {
-            res->writeStatus(statusStr);
-            res->writeHeader("Content-Type", "text/html");
-            res->write(headView);
-            res->write(messageData);
-            res->end(tailView);
-        } else {
+        if constexpr (HasCork<Res>) {
+            // Send error without appending or chunking
+            // Backpressure isn't handled here; we assume it's fine
             res->cork([&]() {
-                 res->writeStatus(statusStr);
-                 res->writeHeader("Content-Type", "text/html");
-                 res->write(headView);
-                 res->write(messageData);
-                 res->end(tailView);
+                size_t contentLength = errorPageHead.size() + errorPageTail.size() + 16;
+                std::string_view messageStr = message.empty() ? defaultErrorMessageForStatus(status) : message;
+                contentLength += messageStr.size();
+                std::string_view titleStr = title.empty() ? status : title;
+                contentLength += titleStr.size();
+
+                res->writeStatus(status);
+                res->unsafeMarkAsWritten(); // Mark as already written to without switching to chunked encoding
+                res->writeRaw(
+                    "Content-Type: text/html\r\n"
+                    "Connection: close\r\n" // This is for safety, though ideally this should be smarter at some point
+                    "Content-Length: "
+                );
+
+                res->writeRaw(std::to_string(contentLength));
+                res->writeRaw("\r\n\r\n");
+                res->writeRaw(errorPageHead);
+                res->writeRaw("<h2>");
+                res->writeRaw(titleStr);
+                res->writeRaw("</h2><p>");
+                res->writeRaw(messageStr);
+                res->writeRaw("</p>");
+                res->writeRaw(errorPageTail);
+                res->endWithoutBody(); // We lie to the server >:), but we end the connection for safety
             });
+        } else {
+            // Temporary slow path requiring chunking for HTTP3
+            // To be updated
+            std::string messageStr;
+            if (!message.empty()) {
+                messageStr.assign(message.data(), message.size());
+            } else {
+                messageStr = defaultErrorMessageForStatus(status);
+            }
+
+            std::string titleStr;
+            if (!title.empty()) {
+                titleStr.assign(title.data(), title.size());
+            } else {
+                titleStr = status.empty() ? "Internal Server Error" : status.data();
+            }
+
+            std::string messageData;
+            messageData.reserve(titleStr.size() + messageStr.size() + 20);
+            messageData.append("<h2>");
+            messageData.append(titleStr);
+            messageData.append("</h2><p>");
+            messageData.append(messageStr);
+            messageData.append("</p>");
+
+            res->writeStatus(status);
+            res->writeHeader("Content-Type", "text/html");
+            res->write(errorPageHead);
+            res->write(messageData);
+            res->end(errorPageTail);
         }
     }
 }
-
-#endif

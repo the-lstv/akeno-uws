@@ -10,7 +10,8 @@
 #include <functional>
 #include <memory>
 #include <filesystem>
-#include <unordered_map>
+
+#include "akeno/FileCache.h"
 
 
 /*
@@ -77,25 +78,25 @@
 */
 
 // Elements that do not have a closing tag
-std::unordered_set<std::string> voidElements = {
+static std::unordered_set<std::string> voidElements = {
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
     "source", "track", "command", "frame", "param", "wbr"
 };
 
 // Elements that only contain text content
-std::unordered_set<std::string> rawElements = {
+static std::unordered_set<std::string> rawElements = {
     "script", "style", "xmp", "textarea", "title"
 };
 
 // Elements allowed when sanitize_html is enabled
-std::unordered_set<std::string> allowedTags = {
+static std::unordered_set<std::string> allowedTags = {
     "a", "b", "blockquote", "br", "caption", "code", "col", "colgroup", "div", "em", "h1", "h2", "h3", "h4", "h5", "h6",
     "hr", "i", "img", "li", "ol", "p", "pre", "q", "small", "span", "strike", "strong", "sub", "sup", "table", "tbody", "td",
     "tfoot", "th", "thead", "tr", "u", "ul"
 };
 
 // Attributes allowed when sanitize_html is enabled
-std::unordered_set<std::string> allowedAttributes = {
+static std::unordered_set<std::string> allowedAttributes = {
     "align", "alt", "border", "cellpadding", "cellspacing", "class", "colspan", "dir", "height", "href", "id", "lang", "rowspan", "src", "title", "width"
 };
 
@@ -170,60 +171,35 @@ public:
     }
 };
 
-
-struct FileCache {
-    std::filesystem::file_time_type lastModified;
-    size_t templateChunkSplit = 0;
-    std::string path;
-    std::string content;
-
-    // FIXME: Would be safer to use path
-    std::shared_ptr<FileCache> templateCache = nullptr;
-    std::filesystem::file_time_type templateLastModified;
-
-    FileCache() = default;
-
-    FileCache(const std::string& path, std::filesystem::file_time_type lastModified)
-        : lastModified(lastModified), path(path), templateCache(nullptr), templateLastModified(lastModified) {}
-
-    FileCache(const std::string& path, const std::string& content, std::filesystem::file_time_type lastModified)
-        : lastModified(lastModified), path(path), content(content), templateCache(nullptr), templateLastModified(lastModified) {}
-
-    bool operator==(const FileCache& other) const {
-        return path == other.path;
-    }
-};
-
-
-struct HTMLParsingPosition {
+struct ____xParser____HTMLParsingPosition {
     // std::shared_ptr<std::vector<char>> buffer = nullptr;
     const char* it;
     const char* chunk_end;
     const char* value_start;
     std::string* output;
-    std::shared_ptr<FileCache> cacheEntry;
+    Akeno::FileCache::CacheEntry* cacheEntry;
 
-    HTMLParsingPosition() 
+    ____xParser____HTMLParsingPosition() 
         : it(nullptr), chunk_end(nullptr), value_start(nullptr), output(nullptr), cacheEntry(nullptr) {}
 
-    HTMLParsingPosition(const char* it, const char* chunk_end, const char* value_start, std::string* output = nullptr, std::shared_ptr<FileCache> cacheEntry = nullptr) 
-        : it(it), chunk_end(chunk_end), value_start(value_start), output(output), cacheEntry(std::move(cacheEntry)) {}
+    ____xParser____HTMLParsingPosition(const char* it, const char* chunk_end, const char* value_start, std::string* output = nullptr, Akeno::FileCache::CacheEntry* cacheEntry = nullptr)
+        : it(it), chunk_end(chunk_end), value_start(value_start), output(output), cacheEntry(cacheEntry) {}
 };
-
-
-// Global cache map
-static std::unordered_map<std::string, std::shared_ptr<FileCache>> fileCache;
 
 class HTMLParsingContext {
 public:
     explicit HTMLParsingContext(std::string_view buf, HTMLParserOptions& options)
         : output(nullptr), it(buf.data()), chunk_end(buf.data() + buf.size()), value_start(buf.data()), buffer(buf), options(options) {
-             md_list_stack.reserve(8);
+            md_list_stack.reserve(8);
+                md_list_item_open_stack.reserve(8);
+                markdown_tag_stack.reserve(4);
         }
 
     explicit HTMLParsingContext(HTMLParserOptions& options)
         : output(nullptr), it(nullptr), chunk_end(nullptr), value_start(nullptr), options(options) {
-             md_list_stack.reserve(8);
+            md_list_stack.reserve(8);
+                md_list_item_open_stack.reserve(8);
+                markdown_tag_stack.reserve(4);
         }
 
     bool enable_html = true;
@@ -259,45 +235,43 @@ public:
         return true;
     }
 
+    void setCache(FileCache* cache) {
+        cacheStore = cache ? cache : &ownedCache;
+    }
+
     bool needsUpdate(std::string filePath) {
-        auto cacheIt = fileCache.find(filePath);
-        if (cacheIt == fileCache.end()) {
+        filePath = std::filesystem::path(filePath).lexically_normal().string();
+        FileCache* cache = activeCache();
+        if (!cache) {
             return true;
         }
 
-        std::error_code ec;
-        if (!std::filesystem::exists(filePath, ec)) return true;
-        auto fileModTime = std::filesystem::last_write_time(filePath, ec);
-        if (ec) return true;
-
-        if (cacheIt->second->lastModified != fileModTime) {
+        const FileCache::CacheEntry* entry = cache->get(filePath, 0);
+        if (!entry) {
             return true;
         }
 
-        // Check template file modification time if it exists
-        // NOTE: Make sure it gets handled if the template gets deleted
-        if (cacheIt->second->templateCache != nullptr) {
-            const auto& tmpl = cacheIt->second->templateCache;
-            if (!std::filesystem::exists(tmpl->path, ec)) return true;
-            auto templateModTime = std::filesystem::last_write_time(tmpl->path, ec);
-            if (ec) return true;
-
-            if (cacheIt->second->templateLastModified != templateModTime) {
-                return true;
-            }
-        }
-        return false;
+        return cache->hasChanged(filePath);
     }
 
     // TODO: This *needs* a better implementation
-    std::string exportCopy(const std::shared_ptr<FileCache>& cacheEntry) {
+    std::string exportCopy(const FileCache::CacheEntry* cacheEntry) {
         if (!cacheEntry) return "";
+        FileCache* cache = activeCache();
+        if (!cache) return "";
 
         // If no template, just wrap the (possibly trimmed) file content
-        if (!cacheEntry->templateCache) return "<!DOCTYPE html>\n" + options.header + "\n<html lang=\"en\">" + cacheEntry->content + "</html>";
+        if (!cacheEntry->shared || cacheEntry->shared->templatePath.empty()) {
+            return "<!DOCTYPE html>\n" + options.header + "\n<html lang=\"en\">" + cacheEntry->buffer + "</html>";
+        }
+
+        const FileCache::CacheEntry* templateEntry = cache->get(cacheEntry->shared->templatePath, 0);
+        if (!templateEntry) {
+            return "<!DOCTYPE html>\n" + options.header + "\n<html lang=\"en\">" + cacheEntry->buffer + "</html>";
+        }
 
         // 1. Extract and remove the file's <head>…</head> content
-        std::string fileContent = cacheEntry->content;
+        std::string fileContent = cacheEntry->buffer;
         std::string fileHeadInner;
         size_t fileHeadOpen = fileContent.find("<head>");
         size_t fileHeadClose = fileContent.find("</head>");
@@ -308,8 +282,7 @@ public:
         }
 
         // 2. Merge extracted head into the template's <head>
-        const auto *tmpl = cacheEntry->templateCache.get();
-        std::string combinedTemplateContent = tmpl->content;
+        std::string combinedTemplateContent = templateEntry->buffer;
 
         size_t tmplHeadOpen2 = std::string::npos;
         size_t tmplHeadClose2 = std::string::npos;
@@ -322,8 +295,8 @@ public:
         }
 
         // 3. Build result, adjusting split if head insert was before it
-        const bool hasSplit = tmpl->templateChunkSplit > 0;
-        const size_t origSplit = tmpl->templateChunkSplit;
+        const size_t origSplit = templateEntry->shared ? templateEntry->shared->templateChunkSplit : 0;
+        const bool hasSplit = origSplit > 0;
         size_t splitPoint = origSplit;
         if (tmplHeadClose2 != std::string::npos && tmplHeadClose2 < origSplit) {
             splitPoint += fileHeadInner.size();
@@ -356,53 +329,26 @@ public:
         return result + "</html>";
     }
 
-    FileCache* fromFile(std::string filePath, void* userData = nullptr, std::string rootPath = "", bool checkCache = true) {
+    FileCache::CacheEntry* fromFile(std::string filePath, void* userData = nullptr, std::string rootPath = "", bool checkCache = true) {
         filePath = std::filesystem::path(filePath).lexically_normal().string();
+        FileCache* cache = activeCache();
+        if (!cache) {
+            lastError = "Cache is not initialized.";
+            return nullptr;
+        }
+
         std::error_code ec;
         if (!std::filesystem::exists(filePath, ec)) {
-            lastError = "Unable to open file: " + filePath;
+            lastError = "File doesn't exist: " + filePath;
             return nullptr;
         }
-        auto fileModTime = std::filesystem::last_write_time(filePath, ec);
-        if (ec) {
-            lastError = "Unable to get file modification time: " + filePath;
-            return nullptr;
-        }
-        
-        bool contentCached = true;
-        bool templateCached = true;
 
         if (checkCache) {
-            auto cacheIt = fileCache.find(filePath);
-            contentCached = cacheIt != fileCache.end() && cacheIt->second->lastModified == fileModTime;
-
-            if (contentCached && cacheIt->second->templateCache != nullptr) {
-                auto templateModTime = std::filesystem::last_write_time(cacheIt->second->templateCache->path, ec);
-                
-                if (ec || cacheIt->second->templateLastModified != templateModTime) {
-                    if (!ec) cacheIt->second->templateLastModified = templateModTime;
-                    templateCached = false;
-
-                    if (contentCached) {
-                        if (fromFile(cacheIt->second->templateCache->path, userData, rootPath) == nullptr) return nullptr;
-                        return cacheIt->second.get();
-                    }
-                }
+            FileCache::CacheEntry* cachedEntry = cache->get(filePath, 0);
+            if (cachedEntry && !cache->hasChanged(filePath)) {
+                cacheEntry = cachedEntry;
+                return cachedEntry;
             }
-
-            if (contentCached && templateCached) {
-                cacheEntry = cacheIt->second;
-                return cacheIt->second.get();
-            }
-        }
-
-        auto newEntry = std::make_shared<FileCache>(filePath, fileModTime);
-        auto [insertIt, inserted] = fileCache.emplace(filePath, newEntry);
-        cacheEntry = insertIt->second;
-
-        if (!inserted) {
-            cacheEntry->content.clear();
-            cacheEntry->lastModified = fileModTime;
         }
 
         std::ifstream file(filePath, std::ios::in | std::ios::binary | std::ios::ate);
@@ -418,8 +364,14 @@ public:
         }
 
         if(size == 0) {
-            cacheEntry->content.clear();
-            return cacheEntry.get();
+            std::vector<std::string> dependencies{filePath};
+            FileCache::CacheEntry* emptyEntry = cache->update(filePath, std::string{}, dependencies);
+            if (emptyEntry && emptyEntry->shared) {
+                emptyEntry->shared->templatePath.clear();
+                emptyEntry->shared->templateChunkSplit = 0;
+            }
+            cacheEntry = emptyEntry;
+            return emptyEntry;
         }
 
         file.seekg(0, std::ios::beg);
@@ -430,8 +382,13 @@ public:
         }
 
         std::string_view fileContent(fileBuffer.data(), fileBuffer.size());
+        std::string parsedContent;
 
-        output = &cacheEntry->content;
+        resetState();
+        cacheEntry = nullptr;
+        buffer = fileContent;
+
+        output = &parsedContent;
         it = fileContent.data();
         chunk_end = fileContent.data() + fileContent.size();
         value_start = it;
@@ -439,12 +396,50 @@ public:
         this->rootPath = rootPath;
         if (userData) this->userData = userData;
 
+        std::vector<std::string> dependencies{filePath};
+        std::vector<std::string>* previousDependencies = activeDependencies;
+        std::string previousTemplatePath = currentTemplatePath;
+        size_t previousTemplateChunkSplit = currentTemplateChunkSplit;
+        std::string previousFilePath = currentFilePath;
+
+        activeDependencies = &dependencies;
+        currentTemplatePath.clear();
+        currentTemplateChunkSplit = 0;
+        currentFilePath = filePath;
+
         resume();
         end();
-        return cacheEntry.get();
+
+        activeDependencies = previousDependencies;
+        currentFilePath = previousFilePath;
+
+        FileCache::CacheEntry* updatedEntry = cache->update(filePath, std::move(parsedContent), dependencies);
+        if (!updatedEntry) {
+            currentTemplatePath = previousTemplatePath;
+            currentTemplateChunkSplit = previousTemplateChunkSplit;
+            lastError = "Failed to update cache entry: " + filePath;
+            return nullptr;
+        }
+
+        std::cout << "Updated cache entry for file: " << filePath << std::endl;
+        if (updatedEntry->shared) {
+            updatedEntry->shared->templatePath = currentTemplatePath;
+            updatedEntry->shared->templateChunkSplit = currentTemplateChunkSplit;
+            std::cout << "Set template path for cache entry: " << currentTemplatePath << " with chunk split at: " << currentTemplateChunkSplit << std::endl;
+        }
+
+        cacheEntry = updatedEntry;
+
+        currentTemplatePath = previousTemplatePath;
+        currentTemplateChunkSplit = previousTemplateChunkSplit;
+        return updatedEntry;
     }
 
     void end() {
+        if (options.buffer && output) {
+            closeMarkdownOutput();
+        }
+
         if(options.onClosingTag) {
             while (!tagStack.empty()) {
                 options.onClosingTag(*output, tagStack, tagStack.top(), userData);
@@ -628,7 +623,8 @@ public:
                     }
 
                     if(in_markdown) {
-                        bool atLineStart = (it == buffer.data() || *(it - 1) == '\n');
+                        bool atLineStart = md_just_consumed_indent || (it == buffer.data() || *(it - 1) == '\n');
+                        md_just_consumed_indent = false;
 
                         // Handle base indentation logic
                         if (atLineStart) {
@@ -650,8 +646,12 @@ public:
                                 pushText(*output);
                                 
                                 int skip = (currentIndent < md_base_indent) ? currentIndent : md_base_indent;
-                                it += skip;
-                                value_start = it;
+                                if (skip > 0) {
+                                    it += skip - 1;
+                                    value_start = it + 1;
+                                    md_just_consumed_indent = true;
+                                    continue;
+                                }
                             }
                         }
 
@@ -742,59 +742,59 @@ public:
 
                         // Table Separator & Next Row
                         if (md_state == MD_TABLE && atLineStart && *it == '|') {
-                             const char* s = it + 1;
-                             bool isSeparator = true;
-                             bool hasDash = false;
-                             while(s < chunk_end && *s != '\n' && *s != '\r') {
-                                 if(*s == '-') hasDash = true;
-                                 if(*s != '|' && *s != '-' && *s != ':' && *s != ' ' && *s != '\t') { isSeparator = false; break; }
-                                 s++;
-                             }
-                             
-                             if(isSeparator && hasDash) {
-                                 pushText(*output);
-                                 output->append("</thead><tbody>");
-                                 md_table_header = false;
-                                 md_table_col_index = 0;
-                                 it = s; 
-                                 value_start = it + 1; 
-                                 continue;
-                             }
-                             
-                             pushText(*output);
-                             output->append("<tr>");
-                             
-                             md_table_col_index = 0;
-                             std::string align = (md_table_col_index < (int)md_table_alignments.size()) ? md_table_alignments[md_table_col_index] : "";
-                             
-                             output->append(md_table_header ? "<th" : "<td");
-                             if(!align.empty()) output->append(" align=\"").append(align).append("\"");
-                             output->append(">");
-                             
-                             it++; 
-                             value_start = it; 
-                             md_table_col_index++;
+                            const char* s = it + 1;
+                            bool isSeparator = true;
+                            bool hasDash = false;
+                            while(s < chunk_end && *s != '\n' && *s != '\r') {
+                                if(*s == '-') hasDash = true;
+                                if(*s != '|' && *s != '-' && *s != ':' && *s != ' ' && *s != '\t') { isSeparator = false; break; }
+                                s++;
+                            }
+
+                            if(isSeparator && hasDash) {
+                                pushText(*output);
+                                output->append("</thead><tbody>");
+                                md_table_header = false;
+                                md_table_col_index = 0;
+                                it = s; 
+                                value_start = it + 1; 
+                                continue;
+                            }
+
+                            pushText(*output);
+                            output->append("<tr>");
+                            
+                            md_table_col_index = 0;
+                            std::string align = (md_table_col_index < (int)md_table_alignments.size()) ? md_table_alignments[md_table_col_index] : "";
+                            
+                            output->append(md_table_header ? "<th" : "<td");
+                            if(!align.empty()) output->append(" align=\"").append(align).append("\"");
+                            output->append(">");
+                            
+                            it++; 
+                            value_start = it; 
+                            md_table_col_index++;
                         }
 
                         // Table Cell
                         if (md_state == MD_TABLE && *it == '|' && !atLineStart && (it == buffer.data() || it[-1] != '\\')) {
-                             pushText(*output);
-                             const char* next = it + 1;
-                             while(next < chunk_end && (*next == ' ' || *next == '\t')) next++;
-                             bool isEnd = (next >= chunk_end || *next == '\n' || *next == '\r');
-                             
-                             if (!isEnd) {
-                                 std::string align = (md_table_col_index < (int)md_table_alignments.size()) ? md_table_alignments[md_table_col_index] : "";
-                                 
-                                 output->append(md_table_header ? "</th><th" : "</td><td");
-                                 if(!align.empty()) output->append(" align=\"").append(align).append("\"");
-                                 output->append(">");
-                                 
-                                 value_start = it + 1;
-                                 md_table_col_index++;
-                             } else {
-                                 value_start = it + 1; 
-                             }
+                            pushText(*output);
+                            const char* next = it + 1;
+                            while(next < chunk_end && (*next == ' ' || *next == '\t')) next++;
+                            bool isEnd = (next >= chunk_end || *next == '\n' || *next == '\r');
+                            
+                            if (!isEnd) {
+                                std::string align = (md_table_col_index < (int)md_table_alignments.size()) ? md_table_alignments[md_table_col_index] : "";
+                                
+                                output->append(md_table_header ? "</th><th" : "</td><td");
+                                if(!align.empty()) output->append(" align=\"").append(align).append("\"");
+                                output->append(">");
+                                
+                                value_start = it + 1;
+                                md_table_col_index++;
+                            } else {
+                                value_start = it + 1; 
+                            }
                         }
 
                         // Code blocks
@@ -876,41 +876,62 @@ public:
                                     if (listIndent > lastIndent) {
                                         output->append(isOrdered ? "<ol>" : "<ul>");
                                         md_list_stack.push_back({listIndent, isOrdered});
+                                        md_list_item_open_stack.push_back(0);
                                     } else {
                                         while(!md_list_stack.empty() && listIndent < md_list_stack.back().first) {
+                                            if (!md_list_item_open_stack.empty() && md_list_item_open_stack.back()) {
+                                                output->append("</li>");
+                                            }
                                             output->append(md_list_stack.back().second ? "</ol>" : "</ul>");
                                             md_list_stack.pop_back();
+                                            if (!md_list_item_open_stack.empty()) {
+                                                md_list_item_open_stack.pop_back();
+                                            }
                                         }
                                         if(md_list_stack.empty()) {
-                                             md_list_stack.push_back({listIndent, isOrdered});
-                                             output->append(isOrdered ? "<ol>" : "<ul>");
+                                            md_list_stack.push_back({listIndent, isOrdered});
+                                            output->append(isOrdered ? "<ol>" : "<ul>");
+                                            md_list_item_open_stack.push_back(0);
                                         } else if (md_list_stack.back().second != isOrdered) {
                                             // Same level but different type... should ideally close and reopen.
                                             // For now simpler: close prev list type, open new.
-                                             output->append(md_list_stack.back().second ? "</ol>" : "</ul>");
-                                             md_list_stack.pop_back();
-                                             md_list_stack.push_back({listIndent, isOrdered});
-                                             output->append(isOrdered ? "<ol>" : "<ul>");
+                                            if (!md_list_item_open_stack.empty() && md_list_item_open_stack.back()) {
+                                                output->append("</li>");
+                                            }
+                                            output->append(md_list_stack.back().second ? "</ol>" : "</ul>");
+                                            md_list_stack.pop_back();
+                                            if (!md_list_item_open_stack.empty()) {
+                                                md_list_item_open_stack.pop_back();
+                                            }
+                                            md_list_stack.push_back({listIndent, isOrdered});
+                                            output->append(isOrdered ? "<ol>" : "<ul>");
+                                            md_list_item_open_stack.push_back(0);
+                                        } else if (!md_list_item_open_stack.empty() && md_list_item_open_stack.back()) {
+                                            output->append("</li>");
+                                            md_list_item_open_stack.back() = 0;
                                         }
                                     }
                                     
                                     output->append("<li>");
+                                    if (!md_list_item_open_stack.empty()) {
+                                        md_list_item_open_stack.back() = 1;
+                                    }
                                     
                                     it = s + 1; // skip marker or dot
                                     
-                                   // Task lists (unordered only technically, but can support both)
+                                    // Task lists (unordered only technically, but can support both)
                                     if (isUnordered && (it + 1) < chunk_end && *it == ' ' && it[1] == '[') {
-                                         if ((it + 3) < chunk_end && it[3] == ']') {
-                                             char mark = it[2];
-                                             if (mark == ' ' || mark == 'x' || mark == 'X') {
-                                                 output->append("<input type=\"checkbox\"");
-                                                 if (mark == 'x' || mark == 'X') output->append(" checked");
-                                                 output->append(" disabled> ");
-                                                 it += 4;
-                                             }
-                                         }
+                                        if ((it + 3) < chunk_end && it[3] == ']') {
+                                            char mark = it[2];
+                                            if (mark == ' ' || mark == 'x' || mark == 'X') {
+                                                output->append("<input type=\"checkbox\"");
+                                                if (mark == 'x' || mark == 'X') output->append(" checked");
+                                                output->append(" disabled> ");
+                                                it += 4;
+                                            }
+                                        }
                                     }
-                                    
+
                                     value_start = it + 1;
                                     continue;
                                 }
@@ -933,207 +954,216 @@ public:
                         
                         // Newline handling for closing block structures
                         if (*it == '\n') {
-                           if (md_state == MD_HEADER) {
-                               pushText(*output);
-                               output->append("</h").append(std::to_string(md_heading_level)).append(">");
-                               md_state = MD_NONE;
-                               md_heading_level = 0;
-                               value_start = it + 1; 
-                               continue;
-                           } else if (!md_list_stack.empty()) {
-                               bool nextIsListItem = false;
-                               int nextIndent = 0;
-                               if ((it + 1) < chunk_end) {
-                                   const char* next = it + 1;
-                                   while(next < chunk_end && (*next == ' ' || *next == '\t')) {
-                                       nextIndent += (*next == '\t' ? 4 : 1);
-                                       next++;
-                                   }
-                                   
-                                  // Check unordered
-                                   if (next < chunk_end && (*next == '-' || *next == '*') && (next + 1) < chunk_end && next[1] == ' ') {
-                                       nextIsListItem = true;
-                                   } 
-                                  // Check ordered
-                                   else if (next < chunk_end && std::isdigit(static_cast<unsigned char>(*next))) {
+                            if (md_state == MD_HEADER) {
+                                pushText(*output);
+                                output->append("</h").append(std::to_string(md_heading_level)).append(">");
+                                md_state = MD_NONE;
+                                md_heading_level = 0;
+                                value_start = it + 1; 
+                                continue;
+                            } else if (!md_list_stack.empty()) {
+                                bool nextIsListItem = false;
+                                int nextIndent = 0;
+                                if ((it + 1) < chunk_end) {
+                                    const char* next = it + 1;
+                                    while(next < chunk_end && (*next == ' ' || *next == '\t')) {
+                                        nextIndent += (*next == '\t' ? 4 : 1);
+                                        next++;
+                                    }
+                                    
+                                    // Check unordered
+                                    if (next < chunk_end && (*next == '-' || *next == '*') && (next + 1) < chunk_end && next[1] == ' ') {
+                                        nextIsListItem = true;
+                                    } 
+                                    // Check ordered
+                                    else if (next < chunk_end && std::isdigit(static_cast<unsigned char>(*next))) {
                                         const char* d = next + 1;
                                         while(d < chunk_end && std::isdigit(static_cast<unsigned char>(*d))) d++;
                                         if (d < chunk_end && *d == '.' && (d+1) < chunk_end && d[1] == ' ') {
                                             nextIsListItem = true;
                                         }
-                                   }
-                               }
+                                    }
+                                }
                                
-                               if (!nextIsListItem) {
+                                if (!nextIsListItem) {
                                     pushText(*output);
                                     while(!md_list_stack.empty()) {
+                                        if (!md_list_item_open_stack.empty() && md_list_item_open_stack.back()) {
+                                            output->append("</li>");
+                                        }
                                         output->append(md_list_stack.back().second ? "</ol>" : "</ul>");
                                         md_list_stack.pop_back();
+                                        if (!md_list_item_open_stack.empty()) {
+                                            md_list_item_open_stack.pop_back();
+                                        }
                                     }
                                     value_start = it; 
-                               } else {
-                                   int setIndent = md_list_stack.back().first;
-                                   if (nextIndent <= setIndent) {
-                                       pushText(*output);
-                                       output->append("</li>");
-                                       value_start = it;
-                                   } else {
-                                       pushText(*output);
-                                       value_start = it + 1;
-                                   }
-                               }
-                           } else if (md_state == MD_TABLE) {
-                                 pushText(*output);
-                                 output->append(md_table_header ? "</th></tr>" : "</td></tr>");
-                                 value_start = it + 1;
-                                 
-                                 bool continues = false;
-                                 if ((it+1) < chunk_end) {
-                                     const char* next = it+1;
-                                     while(next < chunk_end && (*next == ' ' || *next == '\t')) next++;
-                                     if(next < chunk_end && *next == '|') continues = true;
-                                 }
-                                 
-                                 if(!continues) {
-                                     output->append("</tbody></table>");
-                                     md_state = MD_NONE;
-                                     md_table_header = false;
-                                 }
-                           } else if (md_in_quote) {
-                               bool nextIsQuote = false;
-                               if ((it + 1) < chunk_end) {
+                                } else {
+                                    int setIndent = md_list_stack.back().first;
+                                    if (nextIndent <= setIndent) {
+                                        pushText(*output);
+                                        output->append("</li>");
+                                        if (!md_list_item_open_stack.empty()) {
+                                            md_list_item_open_stack.back() = 0;
+                                        }
+                                        value_start = it;
+                                    } else {
+                                        pushText(*output);
+                                        value_start = it + 1;
+                                    }
+                                }
+                            } else if (md_state == MD_TABLE) {
+                                pushText(*output);
+                                output->append(md_table_header ? "</th></tr>" : "</td></tr>");
+                                value_start = it + 1;
+                                
+                                bool continues = false;
+                                if ((it+1) < chunk_end) {
+                                    const char* next = it+1;
+                                    while(next < chunk_end && (*next == ' ' || *next == '\t')) next++;
+                                    if(next < chunk_end && *next == '|') continues = true;
+                                }
+                                
+                                if(!continues) {
+                                    output->append("</tbody></table>");
+                                    md_state = MD_NONE;
+                                    md_table_header = false;
+                                }
+                            } else if (md_in_quote) {
+                                bool nextIsQuote = false;
+                                if ((it + 1) < chunk_end) {
                                     if (*(it + 1) == '>' && (it + 2) < chunk_end && *(it+2) == ' ') nextIsQuote = true;
-                               }
-                               if(!nextIsQuote) {
-                                   pushText(*output);
-                                   output->append("</blockquote>");
-                                   md_in_quote = false;
-                                   value_start = it;
-                               }
-                           }
+                                }
+                                if(!nextIsQuote) {
+                                    pushText(*output);
+                                    output->append("</blockquote>");
+                                    md_in_quote = false;
+                                    value_start = it;
+                                }
+                            }
                         }
 
                         // Bold **
                         if (*it == '*' && (it + 1) < chunk_end && it[1] == '*') {
-                             pushText(*output);
-                             output->append(md_fmt_bold ? "</b>" : "<b>");
-                             md_fmt_bold = !md_fmt_bold;
-                             it += 1;
-                             value_start = it + 1;
-                             continue;
-                        }
-                        
-                        // Italic * (if not bold) or _
-                        if (*it == '*' || *it == '_') {
-                             pushText(*output);
-                             output->append(md_fmt_italic ? "</i>" : "<i>");
-                             md_fmt_italic = !md_fmt_italic;
-                             value_start = it + 1;
-                             continue;
+                            pushText(*output);
+                            output->append(md_fmt_bold ? "</b>" : "<b>");
+                            md_fmt_bold = !md_fmt_bold;
+                            it += 1;
+                            value_start = it + 1;
+                            continue;
                         }
                         
                         // Strike ~~
                         if (*it == '~' && (it + 1) < chunk_end && it[1] == '~') {
-                             pushText(*output);
-                             output->append(md_fmt_strikethrough ? "</s>" : "<s>");
-                             md_fmt_strikethrough = !md_fmt_strikethrough;
-                             it += 1;
-                             value_start = it + 1;
-                             continue;
+                            pushText(*output);
+                            output->append(md_fmt_strikethrough ? "</s>" : "<s>");
+                            md_fmt_strikethrough = !md_fmt_strikethrough;
+                            it += 1;
+                            value_start = it + 1;
+                            continue;
                         }
                         
                         // Underline __
                         if (*it == '_' && (it + 1) < chunk_end && it[1] == '_') {
-                             pushText(*output);
-                             output->append(md_fmt_underline ? "</u>" : "<u>");
-                             md_fmt_underline = !md_fmt_underline;
-                             it += 1;
-                             value_start = it + 1;
-                             continue;
+                            pushText(*output);
+                            output->append(md_fmt_underline ? "</u>" : "<u>");
+                            md_fmt_underline = !md_fmt_underline;
+                            it += 1;
+                            value_start = it + 1;
+                            continue;
+                        }
+                        
+                        // Italic * (if not bold) or _
+                        if (*it == '*' || *it == '_') {
+                            pushText(*output);
+                            output->append(md_fmt_italic ? "</i>" : "<i>");
+                            md_fmt_italic = !md_fmt_italic;
+                            value_start = it + 1;
+                            continue;
                         }
                         
                         // Inline Code `
                         if (*it == '`') {
-                             pushText(*output);
-                             output->append(md_fmt_code ? "</code>" : "<code>");
-                             md_fmt_code = !md_fmt_code;
-                             value_start = it + 1;
-                             continue;
+                            pushText(*output);
+                            output->append(md_fmt_code ? "</code>" : "<code>");
+                            md_fmt_code = !md_fmt_code;
+                            value_start = it + 1;
+                            continue;
                         }
 
                         // Images ![]() and Links []()
                         bool isImage = (*it == '!' && (it + 1) < chunk_end && it[1] == '[');
                         if (isImage || *it == '[') {
-                             const char* startBracket = isImage ? it + 1 : it;
-                             const char* endBracket = nullptr;
-                             const char* startParen = nullptr;
-                             const char* endParen = nullptr;
-                             
-                             for(const char* s = startBracket + 1; s < chunk_end; s++) {
-                                 if(*s == '\n') break; 
-                                 if(*s == ']') {
-                                     endBracket = s;
-                                     if((s + 1) < chunk_end && s[1] == '(') {
-                                         startParen = s + 1;
-                                         for(const char* p = startParen + 1; p < chunk_end; p++) {
-                                             if(*p == '\n') break;
-                                             if(*p == ')') {
-                                                 endParen = p;
-                                                 break;
-                                             }
-                                         }
-                                     }
-                                     break;
-                                 }
-                             }
-                             
-                             if(endBracket && startParen && endParen) {
-                                 pushText(*output);
-                                 std::string_view text(startBracket + 1, endBracket - (startBracket + 1));
-                                 std::string_view urlPart(startParen + 1, endParen - (startParen + 1));
-                                 
-                                 std::string url;
-                                 std::string title;
-                                 
-                                 while(!urlPart.empty() && std::isspace(static_cast<unsigned char>(urlPart.front()))) urlPart.remove_prefix(1);
-                                 while(!urlPart.empty() && std::isspace(static_cast<unsigned char>(urlPart.back()))) urlPart.remove_suffix(1);
+                            const char* startBracket = isImage ? it + 1 : it;
+                            const char* endBracket = nullptr;
+                            const char* startParen = nullptr;
+                            const char* endParen = nullptr;
+                            
+                            for(const char* s = startBracket + 1; s < chunk_end; s++) {
+                                if(*s == '\n') break; 
+                                if(*s == ']') {
+                                    endBracket = s;
+                                    if((s + 1) < chunk_end && s[1] == '(') {
+                                        startParen = s + 1;
+                                        for(const char* p = startParen + 1; p < chunk_end; p++) {
+                                            if(*p == '\n') break;
+                                            if(*p == ')') {
+                                                endParen = p;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                            
+                            if(endBracket && startParen && endParen) {
+                                pushText(*output);
+                                std::string_view text(startBracket + 1, endBracket - (startBracket + 1));
+                                std::string_view urlPart(startParen + 1, endParen - (startParen + 1));
+                                
+                                std::string url;
+                                std::string title;
+                                
+                                while(!urlPart.empty() && std::isspace(static_cast<unsigned char>(urlPart.front()))) urlPart.remove_prefix(1);
+                                while(!urlPart.empty() && std::isspace(static_cast<unsigned char>(urlPart.back()))) urlPart.remove_suffix(1);
 
-                                 if (!urlPart.empty()) {
-                                     size_t firstSpace = urlPart.find_first_of(" \t");
-                                     if (firstSpace != std::string_view::npos) {
-                                         url = std::string(urlPart.substr(0, firstSpace));
-                                         
-                                         std::string_view titlePart = urlPart.substr(firstSpace + 1);
-                                         while(!titlePart.empty() && std::isspace(static_cast<unsigned char>(titlePart.front()))) titlePart.remove_prefix(1);
-                                         
-                                         if (titlePart.size() >= 2 && 
-                                             ((titlePart.front() == '"' && titlePart.back() == '"') || 
-                                              (titlePart.front() == '\'' && titlePart.back() == '\''))) {
-                                             title = std::string(titlePart.substr(1, titlePart.size() - 2));
-                                         }
-                                     } else {
-                                         url = std::string(urlPart);
-                                     }
-                                 }
+                                if (!urlPart.empty()) {
+                                    size_t firstSpace = urlPart.find_first_of(" \t");
+                                    if (firstSpace != std::string_view::npos) {
+                                        url = std::string(urlPart.substr(0, firstSpace));
+                                        
+                                        std::string_view titlePart = urlPart.substr(firstSpace + 1);
+                                        while(!titlePart.empty() && std::isspace(static_cast<unsigned char>(titlePart.front()))) titlePart.remove_prefix(1);
+                                        
+                                        if (titlePart.size() >= 2 && 
+                                            ((titlePart.front() == '"' && titlePart.back() == '"') || 
+                                             (titlePart.front() == '\'' && titlePart.back() == '\''))) {
+                                            title = std::string(titlePart.substr(1, titlePart.size() - 2));
+                                        }
+                                    } else {
+                                        url = std::string(urlPart);
+                                    }
+                                }
 
-                                 if (sanitize_html && !isSafeLink(url)) {
-                                     url = "#";
-                                 }
-                                 
-                                 if(isImage) {
-                                     output->append("<img src=\"").append(escapeAttribute(url)).append("\" alt=\"").append(escapeAttribute(text)).append("\"");
-                                     if(!title.empty()) output->append(" title=\"").append(escapeAttribute(title)).append("\"");
-                                     output->append(">");
-                                 } else {
-                                     output->append("<a href=\"").append(escapeAttribute(url)).append("\"");
-                                     if(!title.empty()) output->append(" title=\"").append(escapeAttribute(title)).append("\"");
-                                     output->append(">").append(escapeAttribute(text)).append("</a>");
-                                 }
+                                if (sanitize_html && !isSafeLink(url)) {
+                                    url = "#";
+                                }
+                                
+                                if(isImage) {
+                                    output->append("<img src=\"").append(escapeAttribute(url)).append("\" alt=\"").append(escapeAttribute(text)).append("\"");
+                                    if(!title.empty()) output->append(" title=\"").append(escapeAttribute(title)).append("\"");
+                                    output->append(">");
+                                } else {
+                                    output->append("<a href=\"").append(escapeAttribute(url)).append("\"");
+                                    if(!title.empty()) output->append(" title=\"").append(escapeAttribute(title)).append("\"");
+                                    output->append(">").append(escapeAttribute(text)).append("</a>");
+                                }
 
-                                 it = endParen;
-                                 value_start = it + 1;
-                                 continue;
-                             }
+                                it = endParen;
+                                value_start = it + 1;
+                                continue;
+                            }
                         }
                     }
 
@@ -1158,6 +1188,9 @@ public:
                                 }
 
                                 if(in_markdown && !parent_markdown) {
+                                    if (options.buffer && output) {
+                                        closeMarkdownOutput();
+                                    }
                                     resetMarkdownState();
                                 } else {
                                     in_markdown = parent_markdown;
@@ -1190,19 +1223,22 @@ public:
                     if (*it == '>' || *it == '/' || std::isspace(static_cast<unsigned char>(*it))) {
 
                         if(!end_tag) {
-                           // Handle opening tags
+                            // Handle opening tags
                             std::string_view tag(value_start, it - value_start);
 
                             bool prev_markdown = in_markdown;
 
                             ls_template_tag = is_template && template_scope == "ls" && tag == "template";
 
-                            if(!in_markdown && !options.vanilla) {
+                            if(!options.vanilla && tag == "markdown") {
+                                markdown_tag_stack.push_back(prev_markdown);
+                                in_markdown = true;
+                            } else if(!in_markdown && !options.vanilla) {
                                 in_markdown = !ls_template_tag && tag == "markdown";
                             }
 
                             render_element = !is_template && !ls_template_tag;
-                            
+
                             if(!options.vanilla) {
                                 render_element = render_element && tag != "html" && tag != "!DOCTYPE" && tag != "markdown";
                             }
@@ -1279,6 +1315,24 @@ public:
                         }
                         state = TEXT;
 
+                        if (!options.vanilla && closingTag == "markdown") {
+                            bool parent_markdown = false;
+                            if (!markdown_tag_stack.empty()) {
+                                parent_markdown = markdown_tag_stack.back();
+                                markdown_tag_stack.pop_back();
+                            }
+
+                            if(in_markdown && !parent_markdown) {
+                                if (options.buffer && output) {
+                                    closeMarkdownOutput();
+                                }
+                                resetMarkdownState();
+                            }
+
+                            in_markdown = parent_markdown;
+                            break;
+                        }
+
                         if(tagStack.empty()) continue;
 
                         if(tagStack.top() != closingTag) {
@@ -1302,6 +1356,9 @@ public:
                         }
 
                         if(in_markdown && !parent_markdown) {
+                            if (options.buffer && output) {
+                                closeMarkdownOutput();
+                            }
                             resetMarkdownState();
                         } else {
                             in_markdown = parent_markdown;
@@ -1359,6 +1416,14 @@ public:
 
                             if(!options.vanilla && attribute_view == "@import" && options.enableImport) {
                                 pending_import_attr = true;
+                            }
+
+                            if (pending_markdown_attr && attribute_view == "markdown" && *it != '=') {
+                                pending_markdown_attr = false;
+                            }
+
+                            if (pending_import_attr && attribute_view == "@import" && *it != '=') {
+                                pending_import_attr = false;
                             }
 
                             if (ls_template_tag) {
@@ -1444,6 +1509,9 @@ public:
                                 }
 
                                 if(in_markdown && !parent_markdown) {
+                                    if (options.buffer && output) {
+                                        closeMarkdownOutput();
+                                    }
                                     resetMarkdownState();
                                 } else {
                                     in_markdown = parent_markdown;
@@ -1476,13 +1544,16 @@ public:
 
                             if(pending_markdown_attr) {
                                 if(value == "off" || value == "false") {
+                                    if (options.buffer && output) {
+                                        closeMarkdownOutput();
+                                    }
                                     in_markdown = false;
                                 }
                                 pending_markdown_attr = false;
                             } else if(pending_import_attr) {
                                 if(!value.empty()) {
                                     std::filesystem::path p(rootPath);
-                                    if(cacheEntry && !cacheEntry->path.empty()) p = std::filesystem::path(cacheEntry->path).parent_path();
+                                    if(!currentFilePath.empty()) p = std::filesystem::path(currentFilePath).parent_path();
                                     
                                     p /= value;
                                     std::cout << "Importing file: " << p.string() << std::endl;
@@ -1531,7 +1602,7 @@ public:
                     if(*it == '}' && (it + 1) < chunk_end && it[1] == '}') {
                         if(it > value_start){
 
-                           // Handle inline values
+                            // Handle inline values
 
                             if (options.onInline) {
                                 options.onInline(*output, tagStack, rtrim(std::string_view(value_start, it - value_start)), userData);
@@ -1555,14 +1626,14 @@ public:
                         if(isSpace || *it == '\n' || *it == '\r') {
                             special_modifier_type = std::string_view(value_start, it - value_start);
 
-                           // Allow markdown across the whole file
+                            // Allow markdown across the whole file
                             if(special_modifier_type == "markdown") {
                                 in_markdown = true;
                             }
 
                             if(!isSpace) {
                                 if((it + 1) < chunk_end && (it[1] == '#')) {
-                                   // Next modifier;
+                                    // Next modifier;
                                     it += 1;
                                 } else {
                                     state = TEXT;
@@ -1575,7 +1646,7 @@ public:
                         std::string_view modifierValue(value_start, it - value_start);
                         
                         if((it + 1) < chunk_end && (it[1] == '#')) {
-                           // Next modifier;
+                            // Next modifier;
                             it += 1;
                         } else {
                             state = TEXT;
@@ -1584,30 +1655,34 @@ public:
                         value_start = it + 1;
 
                         if(special_modifier_type == "template") {
-                            if (template_enabled && !modifierValue.empty() && cacheEntry) {
-                                std::string templateFile = rootPath + std::string(modifierValue);
+                            if (template_enabled && !modifierValue.empty()) {
+                                std::string templateFile = std::filesystem::path(rootPath + std::string(modifierValue)).lexically_normal().string();
     
                                 ParsingState oldState = captureState();
-                                HTMLParsingPosition originalPosition = storePosition();
-                                
-                                FileCache* templateCacheEntry = fromFile(templateFile, userData, rootPath);
+                                ____xParser____HTMLParsingPosition originalPosition = storePosition();
+
+                                FileCache::CacheEntry* templateCacheEntry = fromFile(templateFile, userData, rootPath);
 
                                 restorePosition(originalPosition);
                                 restoreState(oldState);
+
+                                // This has to be set; somehow it isn't by default
+                                // cacheEntry->shared->templatePath = templateFile;
                                 
                                 if (templateCacheEntry) {
-                                    cacheEntry->templateLastModified = templateCacheEntry->lastModified;
-                                    cacheEntry->templateCache = fileCache[templateCacheEntry->path];
+                                    currentTemplatePath = templateFile;
+                                    trackDependency(templateFile);
+                                    trackDependenciesFromEntry(templateCacheEntry);
                                 } else {
                                     std::cerr << "Error accessing template file: " << lastError << std::endl;
                                 }
     
-                               // if (cacheEntry->templateChunkSplit > 0) {
-                               //     output->append(cacheEntry->content, 0, cacheEntry->templateChunkSplit);
-                               // } else {
-                               //     // Otherwise, append the whole content
-                               //     output->append(cacheEntry->content);
-                               // }
+                                // if (cacheEntry->templateChunkSplit > 0) {
+                                //     output->append(cacheEntry->content, 0, cacheEntry->templateChunkSplit);
+                                // } else {
+                                //     // Otherwise, append the whole content
+                                //     output->append(cacheEntry->content);
+                                // }
                             }
                         }
 
@@ -1621,8 +1696,8 @@ public:
             pushText(*output);
         }
 
-        // if(cacheEntry->templateChunkSplit && !inside_template_file) {
-        //     output->append(cacheEntry->content, cacheEntry->templateChunkSplit, cacheEntry->content.size() - cacheEntry->templateChunkSplit);
+        // if(currentTemplateChunkSplit && !inside_template_file) {
+        //     output->append(cacheEntry->buffer, currentTemplateChunkSplit, cacheEntry->buffer.size() - currentTemplateChunkSplit);
         // }
     }
 
@@ -1631,6 +1706,7 @@ public:
      * Be cautious with this, as the state does not get reset.
      */
     bool inlineFile(std::string filePath) {
+        filePath = std::filesystem::path(filePath).lexically_normal().string();
         std::ifstream file(filePath, std::ios::in | std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
             lastError = "Failed to open file: " + filePath;
@@ -1652,17 +1728,21 @@ public:
 
         std::string_view fileContent(buffer.data(), size);
 
-        HTMLParsingPosition pos = storePosition();
-        HTMLParsingPosition newPos(fileContent.data(), fileContent.data() + fileContent.size(), fileContent.data(), output);
+        ____xParser____HTMLParsingPosition pos = storePosition();
+        ____xParser____HTMLParsingPosition newPos(fileContent.data(), fileContent.data() + fileContent.size(), fileContent.data(), output);
+        std::string previousFilePath = currentFilePath;
+        currentFilePath = filePath;
+        trackDependency(filePath);
         restorePosition(newPos);
         resume();
         restorePosition(pos);
+        currentFilePath = previousFilePath;
         return true;
     }
 
     std::stack<std::string_view> tagStack;
     std::stack<bool> markdownStack;
-    // std::stack<HTMLParsingPosition> tree;
+    // std::stack<____xParser____HTMLParsingPosition> tree;
 
     std::string body_attributes;
     bool inside_head = false;
@@ -1691,7 +1771,38 @@ private:
     std::string_view buffer;
     std::string rootPath;
 
-    std::shared_ptr<FileCache> cacheEntry = nullptr;
+    FileCache ownedCache;
+    FileCache* cacheStore = &ownedCache;
+    std::vector<std::string>* activeDependencies = nullptr;
+    std::string currentTemplatePath;
+    size_t currentTemplateChunkSplit = 0;
+    std::string currentFilePath;
+
+    FileCache::CacheEntry* cacheEntry = nullptr;
+
+    void trackDependency(const std::string &path) {
+        if (!activeDependencies) {
+            return;
+        }
+        for (const auto &tracked : *activeDependencies) {
+            if (tracked == path) {
+                return;
+            }
+        }
+        activeDependencies->push_back(path);
+    }
+
+    void trackDependenciesFromEntry(const FileCache::CacheEntry *entry) {
+        if (!entry || !entry->shared) {
+            return;
+        }
+        for (const auto &info : entry->shared->paths) {
+            trackDependency(info.path);
+        }
+        if (!entry->shared->templatePath.empty()) {
+            trackDependency(entry->shared->templatePath);
+        }
+    }
 
     char string_char = 0;
 
@@ -1711,6 +1822,10 @@ private:
 
     std::string current_attr_name;
     bool current_attr_allowed = false;
+
+    FileCache* activeCache() {
+        return cacheStore ? cacheStore : &ownedCache;
+    }
 
     void resetState() {
         end_tag = false;
@@ -1742,6 +1857,7 @@ private:
         ls_template_attr_name.clear();
         ls_template_buffer.clear();
         ls_inline_script.clear();
+        markdown_tag_stack.clear();
         reset = true;
     }
 
@@ -1757,10 +1873,13 @@ private:
     bool pending_import_attr = false;
     int md_base_indent = -1;
     MarkdownState md_state = MD_NONE;
+    std::vector<uint8_t> md_list_item_open_stack;
+    std::vector<bool> markdown_tag_stack;
 
     std::vector<std::pair<int, bool>> md_list_stack; // indent, is_ordered
     std::vector<std::string> md_table_alignments;
     int md_table_col_index = 0;
+    bool md_just_consumed_indent = false;
 
     struct ParsingState {
         std::stack<std::string_view> tagStack;
@@ -1785,6 +1904,8 @@ private:
         std::vector<std::pair<int, bool>> md_list_stack;
         std::vector<std::string> md_table_alignments;
         int md_table_col_index;
+        std::vector<uint8_t> md_list_item_open_stack;
+        std::vector<bool> markdown_tag_stack;
     };
     
     ParsingState captureState() {
@@ -1793,7 +1914,7 @@ private:
             in_markdown, md_in_quote, md_table_header,
             md_fmt_bold, md_fmt_italic, md_fmt_code, md_fmt_underline, md_fmt_strikethrough,
             md_heading_level, pending_markdown_attr, pending_import_attr, md_base_indent, md_state,
-            md_list_stack, md_table_alignments, md_table_col_index
+            md_list_stack, md_table_alignments, md_table_col_index, md_list_item_open_stack, markdown_tag_stack
         };
     }
     
@@ -1820,6 +1941,8 @@ private:
         md_list_stack = s.md_list_stack;
         md_table_alignments = s.md_table_alignments;
         md_table_col_index = s.md_table_col_index;
+        md_list_item_open_stack = s.md_list_item_open_stack;
+        markdown_tag_stack = s.markdown_tag_stack;
     }
 
     void resetMarkdownState() {
@@ -1831,6 +1954,8 @@ private:
         md_list_stack.clear();
         md_table_alignments.clear();
         md_table_col_index = 0;
+        md_list_item_open_stack.clear();
+        md_just_consumed_indent = false;
         
         md_fmt_bold = false;
         md_fmt_italic = false;
@@ -1838,6 +1963,72 @@ private:
         md_fmt_underline = false;
         md_fmt_strikethrough = false;
         md_in_quote = false;
+    }
+
+    void closeMarkdownOutput() {
+        if (!options.buffer || !output) return;
+
+        if (md_state == MD_CODEBLOCK) {
+            output->append("</code></pre>");
+            md_state = MD_NONE;
+        }
+
+        if (md_state == MD_HEADER && md_heading_level > 0) {
+            output->append("</h").append(std::to_string(md_heading_level)).append(">");
+            md_state = MD_NONE;
+            md_heading_level = 0;
+        }
+
+        if (md_state == MD_TABLE) {
+            output->append(md_table_header ? "</th></tr>" : "</td></tr>");
+            output->append("</tbody></table>");
+            md_state = MD_NONE;
+            md_table_header = false;
+            md_table_col_index = 0;
+        }
+
+        if (!md_list_stack.empty()) {
+            while(!md_list_stack.empty()) {
+                if (!md_list_item_open_stack.empty() && md_list_item_open_stack.back()) {
+                    output->append("</li>");
+                }
+                output->append(md_list_stack.back().second ? "</ol>" : "</ul>");
+                md_list_stack.pop_back();
+                if (!md_list_item_open_stack.empty()) {
+                    md_list_item_open_stack.pop_back();
+                }
+            }
+        }
+
+        if (md_in_quote) {
+            output->append("</blockquote>");
+            md_in_quote = false;
+        }
+
+        if (md_fmt_code) {
+            output->append("</code>");
+            md_fmt_code = false;
+        }
+
+        if (md_fmt_italic) {
+            output->append("</i>");
+            md_fmt_italic = false;
+        }
+
+        if (md_fmt_underline) {
+            output->append("</u>");
+            md_fmt_underline = false;
+        }
+
+        if (md_fmt_strikethrough) {
+            output->append("</s>");
+            md_fmt_strikethrough = false;
+        }
+
+        if (md_fmt_bold) {
+            output->append("</b>");
+            md_fmt_bold = false;
+        }
     }
 
     void pushText(std::string& buffer) {
@@ -1869,8 +2060,8 @@ private:
             template_scope = std::string_view();
             is_template = false;
 
-            if(current_template_scope == "template" && cacheEntry) {
-                cacheEntry->templateChunkSplit = output->size();
+            if(current_template_scope == "template") {
+                currentTemplateChunkSplit = output->size();
                 return;
             } else {
                 // TODO:
@@ -1919,11 +2110,11 @@ private:
         return s.substr(start, end - start + 1);
     }
 
-    HTMLParsingPosition storePosition() {
-        return HTMLParsingPosition(it, chunk_end, value_start, output, cacheEntry);
+    ____xParser____HTMLParsingPosition storePosition() {
+        return ____xParser____HTMLParsingPosition(it, chunk_end, value_start, output, cacheEntry);
     }
 
-    void restorePosition(HTMLParsingPosition& pos) {
+    void restorePosition(____xParser____HTMLParsingPosition& pos) {
         it = pos.it;
         chunk_end = pos.chunk_end;
         value_start = pos.value_start;
@@ -2134,7 +2325,7 @@ private:
                         char q = content[p++];
                         size_t vstart = p;
                         while (p < content.size() && content[p] != q) ++p;
-                                               attrValue = std::string(content.substr(vstart, p - vstart));
+                        attrValue = std::string(content.substr(vstart, p - vstart));
                         if (p < content.size()) ++p;
                     } else {
                         size_t vstart = p;

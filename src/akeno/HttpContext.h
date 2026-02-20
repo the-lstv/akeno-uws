@@ -17,8 +17,7 @@
  * limitations under the License.
  */
 
-#ifndef UWS_HTTPCONTEXT_AKENO_H
-#define UWS_HTTPCONTEXT_AKENO_H
+#pragma once
 
 /* HTTP context with integrated Akeno domain routing and SNI fast-path.
  *
@@ -42,6 +41,9 @@
 
 // Akeno domain router
 #include "akeno/Router.h"
+
+// WebServer
+#include "akeno/WebApp.h"
 
 namespace uWS {
 template<bool> struct HttpResponse;
@@ -129,7 +131,8 @@ private:
 #endif
 
             /* The return value is entirely up to us to interpret. The HttpParser only care for whether the returned value is DIFFERENT or not from passed user */
-            auto [err, returnedSocket] = httpResponseData->consumePostPadded(data, (unsigned int) length, s, proxyParser, [httpContextData](void *s, HttpRequest *httpRequest) -> void * {
+            auto *context = (HttpContext<SSL> *) getSocketContext((us_socket_t *) s);
+            auto [err, returnedSocket] = httpResponseData->consumePostPadded(data, (unsigned int) length, s, proxyParser, [context, httpContextData](void *s, HttpRequest *httpRequest) -> void * {
                 /* For every request we reset the timeout and hang until user makes action */
                 /* Warning: if we are in shutdown state, resetting the timer is a security issue! */
                 us_socket_timeout(SSL, (us_socket_t *) s, 0);
@@ -154,7 +157,6 @@ private:
                     httpResponseData->state |= HttpResponseData<SSL>::HTTP_CONNECTION_CLOSE;
                 }
 
-                // I am going to assume this is fine??
                 auto *res = (HttpResponse<SSL>*)s;
 
                 std::string_view method = httpRequest->getCaseSensitiveMethod();
@@ -162,14 +164,14 @@ private:
                 // OPTIONS fast-path
                 // IMPORTANT TODO: More flexible CORS handling, though I don't know how to approach this yet.
                 if (method == "OPTIONS") {
-                    res->writeHeader("Access-Control-Allow-Origin", "*");
-                    res->writeHeader("Access-Control-Allow-Methods",
-                                    "GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD");
-                    res->writeHeader("Access-Control-Allow-Headers",
-                                    "Content-Type, Authorization");
-                    res->writeHeader("Cache-Control", "max-age=1382400");
-                    res->writeHeader("Access-Control-Max-Age", "1382400");
-                    res->end();
+                    res->writeRaw(
+                        "Access-Control-Allow-Origin: *\r\n"
+                        "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD\r\n"
+                        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+                        "Cache-Control: max-age=1382400\r\n"
+                        "Access-Control-Max-Age: 1382400\r\n"
+                    );
+                    res->endWithoutBody();
                     return nullptr;
                 }
 
@@ -200,16 +202,13 @@ private:
                         // www redirect fast-path
                         // TODO: Set from config
                         if (host.length() > 4 && host.starts_with("www.")) { // If it's exactly "www.", we let it pass
-                            res->writeStatus("301 Moved Permanently");
-
                             std::string location;
                             location.reserve(8 + host.size() + url.size());
                             location += SSL ? "https://" : "http://";
                             location.append(host.data() + 4, host.size() - 4);
                             location += url;
 
-                            res->writeHeader("Location", location);
-                            res->end();
+                            res->redirect(location);
                             return nullptr;
                         }
 
@@ -220,38 +219,8 @@ private:
                     }
                 }
 
-                // std::cout << "Received request for domain: " << domain << " with path: " << url << std::endl;
-
-                /* Route via domain router (fallback from SNI or for non-SSL) */
-                /* This is always the case for wildcards */
-                DomainHandler *domainMatch = sniHandler;
-
-                if (!domainMatch && httpContextData->domainRouter) {
-                    domainMatch = ((Akeno::DomainRouter<DomainHandler> *) httpContextData->domainRouter)->match(domain);
-                }
-
-                if (!domainMatch) {
-                    // No route found for domain
-                    Akeno::sendErrorPage(res, "404");
+                if (!context->routeRequest(res, httpRequest, host, domain, url, sniHandler)) {
                     return nullptr;
-                }
-
-                // Recursively resolve path matchers
-                DomainHandler *resolved = domainMatch->kind == DomainHandler::Kind::PathMatcher? resolveDomainHandler(domainMatch, url): domainMatch;
-                if (!resolved) {
-                    // TODO: Helper for an user-provided 404 within an App context
-                    // Though this is low priority as users can just define it themselves
-                    Akeno::sendErrorPage(res, "404");
-                    return nullptr;
-                }
-
-                if (resolved->kind == DomainHandler::Kind::Callback && resolved->hasCallback<SSL>()) {
-                    resolved->invokeCallback<SSL>((HttpResponse<SSL> *) res, httpRequest);
-                } else {
-                    if (resolved->kind == DomainHandler::Kind::StaticBuffer && resolved->staticBuffer) {
-                        res->end(std::string_view(resolved->staticBuffer->data(), resolved->staticBuffer->size()));
-                        return nullptr;
-                    }                    
                 }
 
                 if (httpContextData->upgradedWebSocket || us_socket_is_closed(SSL, (struct us_socket_t *) s) || us_socket_is_shut_down(SSL, (us_socket_t *) s)) {
@@ -393,6 +362,50 @@ private:
     }
 
 public:
+    /* Route a HTTP request */
+    bool routeRequest(HttpResponse<SSL> *res, HttpRequest *httpRequest, std::string_view host, std::string_view domain, std::string_view url, DomainHandler *sniHandler = nullptr) {
+        HttpContextData<SSL> *httpContextData = getSocketContextDataS((us_socket_t *) res);
+
+        // std::cout << "Received request for domain: " << domain << " with path: " << url << std::endl;
+
+        /* Route via domain router (fallback from SNI or for non-SSL) */
+        /* This is always the case for wildcards */
+        DomainHandler *domainMatch = sniHandler;
+
+        if (!domainMatch && httpContextData->domainRouter) {
+            domainMatch = ((Akeno::DomainRouter<DomainHandler> *) httpContextData->domainRouter)->match(domain);
+        }
+
+        if (!domainMatch) {
+            // No route found for domain
+            Akeno::sendErrorPage(res, "404", "No route for this domain was found on this server.");
+            return false;
+        }
+
+        // Recursively resolve path matchers
+        DomainHandler *resolved = domainMatch->kind == DomainHandler::Kind::PathMatcher? resolveDomainHandler(domainMatch, url): domainMatch;
+        if (!resolved) {
+            // TODO: Helper for an user-provided 404 within an App context
+            // Though this is low priority as users can just define it themselves
+            Akeno::sendErrorPage(res, "404");
+            return false;
+        }
+
+        if (resolved->kind == DomainHandler::Kind::Callback && resolved->hasCallback<SSL>()) {
+            resolved->invokeCallback<SSL>((HttpResponse<SSL> *) res, httpRequest);
+        } else if (resolved->kind == DomainHandler::Kind::WebApp && resolved->webApp) {
+            Akeno::WebServer::onRequest(res, httpRequest, resolved->webApp.get());
+        } else if (resolved->kind == DomainHandler::Kind::StaticBuffer && resolved->staticBuffer) {
+            res->end(std::string_view(resolved->staticBuffer->data(), resolved->staticBuffer->size()));
+            return false;
+        } else {
+            // No valid handler found
+            Akeno::sendErrorPage(res, "404", "Nothing was found to handle this request.");
+            return false;
+        }
+        return true;
+    }
+
     /* Construct a new HttpContext using specified loop */
     static HttpContext *create(Loop *loop, us_socket_context_options_t options = {}) {
         HttpContext *httpContext;
@@ -441,5 +454,3 @@ public:
 };
 
 }
-
-#endif // UWS_HTTPCONTEXT_AKENO_H

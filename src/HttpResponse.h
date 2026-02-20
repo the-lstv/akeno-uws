@@ -47,6 +47,11 @@ namespace uWS {
 
 /* Some pre-defined status constants to use with writeStatus */
 static const char *HTTP_200_OK = "200 OK";
+static const char *HTTP_301_MOVED_PERMANENTLY = "301 Moved Permanently";
+static const char *HTTP_302_FOUND = "302 Found";
+static const char *HTTP_400_BAD_REQUEST = "400 Bad Request";
+static const char *HTTP_404_NOT_FOUND = "404 Not Found";
+static const char *HTTP_500_INTERNAL_SERVER_ERROR = "500 Internal Server Error";
 
 /* The general timeout for HTTP sockets */
 static const int HTTP_TIMEOUT_S = 10;
@@ -186,6 +191,10 @@ private:
             /* We only expose major version */
             writeHeader("uWebSockets", "20");
         }
+#endif
+        /* TODO: Option to disable this */
+#ifndef AKENO_HTTPRESPONSE_NO_WRITEMARK
+        writeRaw("X-Powered-By: Akeno/" AKENO_VERSION "\r\n");
 #endif
     }
 
@@ -524,6 +533,34 @@ public:
         return this;
     }
 
+    /* Write raw header data (use with caution i guess) */
+    HttpResponse *writeRaw(std::string_view data) {
+        writeStatus(HTTP_200_OK);
+        Super::write(data.data(), (int) data.length());
+        return this;
+    }
+
+    /* Writes a redirect. This MUST be the only operation. */
+    HttpResponse *redirect(std::string_view location, std::string_view status = HTTP_302_FOUND) {
+        writeStatus(status);
+        Super::write("Location: ", 10);
+        Super::write(location.data(), (int) location.length());
+        Super::write("\r\n", 2);
+        internalEnd({nullptr, 0}, 0, false, false, false);
+        return this;
+    }
+
+    /* Redirect to HTTPS (zero copy) */
+    HttpResponse *redirectToHTTPS(std::string_view host, std::string_view url) {
+        writeStatus(HTTP_301_MOVED_PERMANENTLY);
+        Super::write("Location: https://", 18);
+        Super::write(host.data(), (int) host.length());
+        Super::write(url.data(), (int) url.length());
+        Super::write("\r\n", 2);
+        internalEnd({nullptr, 0}, 0, false, false, false);
+        return this;
+    }
+
     /* End without a body (no content-length) or end with a spoofed content-length. */
     void endWithoutBody(std::optional<size_t> reportedContentLength = std::nullopt, bool closeConnection = false) {
         if (reportedContentLength.has_value()) {
@@ -536,6 +573,25 @@ public:
     /* End the response with an optional data chunk. Always starts a timeout. */
     void end(std::string_view data = {}, bool closeConnection = false) {
         internalEnd(data, data.length(), false, true, closeConnection);
+    }
+
+    /* End the response with an optional data chunk. Always starts a timeout. */
+    void endWithoutContentLength(std::string_view data = {}, bool closeConnection = false) {
+        internalEnd(data, data.length(), false, false, closeConnection);
+    }
+
+    void reroute(void* req, std::string_view host, std::string_view url) {
+        HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
+
+        if (httpResponseData->state & HttpResponseData<SSL>::HTTP_STATUS_CALLED) {
+            std::cerr << "Error: Cannot reroute after writing status!" << std::endl;
+            end();
+            return;
+        }
+
+        // Get the current HttpContext
+        HttpContext<SSL> *httpContext = (HttpContext<SSL> *) us_socket_context(SSL, (struct us_socket_t *) this);
+        httpContext->routeRequest(this, (HttpRequest *)req, host, host, url);
     }
 
     /* Try and end the response. Returns [true, true] on success.
@@ -618,6 +674,16 @@ public:
 
         /* If we did not fail the write, accept more */
         return !failed;
+    }
+
+    void unsafeMarkAsWritten() {
+        HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
+        httpResponseData->state |= HttpResponseData<SSL>::HTTP_WRITE_CALLED;
+    }
+
+    void unsafeMarkAsEnded() {
+        HttpResponseData<SSL> *httpResponseData = getHttpResponseData();
+        httpResponseData->state |= HttpResponseData<SSL>::HTTP_END_CALLED;
     }
 
     /* Get the current byte write offset for this Http response */

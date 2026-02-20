@@ -1,6 +1,4 @@
-
-#ifndef AKENO_RATE_LIMITER_H
-#define AKENO_RATE_LIMITER_H
+#pragma once
 
 #include <array>
 #include <chrono>
@@ -131,5 +129,3 @@ namespace Akeno {
 		}
 	};
 }
-
-#endif // AKENO_RATE_LIMITER_H

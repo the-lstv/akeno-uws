@@ -17,11 +17,7 @@
  * limitations under the License.
  */
 
-#ifndef UWS_APP_H
-#define UWS_APP_H
-
-// Important TODO: keep version in sync with package.json
-#define AKENO_VERSION "1.6.9-beta"
+#pragma once
 
 #define _CRT_SECURE_NO_WARNINGS
 
@@ -633,5 +629,3 @@ namespace uWS {
     typedef uWS::TemplatedProtocol<false> HTTPProtocol;
     typedef uWS::TemplatedProtocol<true> HTTPSProtocol;
 }
-
-#endif // UWS_APP_H
