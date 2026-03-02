@@ -197,8 +197,13 @@ namespace Akeno
             std::filesystem::path normalizedRootPath(rootPath);
             normalizedRootPath = normalizedRootPath.lexically_normal();
             
+            #ifdef _WIN32
+            const std::string normalizedRoot = normalizedRootPath.generic_string();
+            const std::string fullStr = full.generic_string();
+            #else
             const std::string& normalizedRoot = normalizedRootPath.native();
             const std::string& fullStr = full.native();
+            #endif
             
             if (fullStr.find(normalizedRoot) != 0 || 
                 (fullStr.length() > normalizedRoot.length() &&
@@ -385,7 +390,11 @@ namespace Akeno
                 std::filesystem::path aliasPath = file;
                 aliasPath += ".html";
                 if (std::filesystem::exists(aliasPath)) {
+                    #ifdef _WIN32
+                    file = aliasPath.string();
+                    #else
                     file = aliasPath;
+                    #endif
                     mimeType = "text/html";
                     exists = true;
                     // We will check if it is a reular file later
@@ -394,7 +403,11 @@ namespace Akeno
                 // Try to resolve *.html, /index.html
                 std::filesystem::path indexPath = std::filesystem::path(file) / "index.html";
                 if (std::filesystem::exists(indexPath)) {
+                    #ifdef _WIN32
+                    file = indexPath.string();
+                    #else
                     file = indexPath.native();
+                    #endif
                     mimeType = "text/html";
                     // We will check if it is a reular file later
                 } else {

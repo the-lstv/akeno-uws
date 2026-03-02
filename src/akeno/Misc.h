@@ -47,6 +47,7 @@ namespace Akeno {
     }
 
     // For HTTP/3, we have to use writeHeader instead of writeRaw (because HTTP/3 uses packed headers magic)
+#ifndef UWS_NO_HTTP3
     void sendJSONError(uWS::Http3Response *res, std::string_view message, int code = 400, std::string_view status = uWS::HTTP_400_BAD_REQUEST) {
         res->writeStatus(status);
         // TODO: Move CORS headers to a better place
@@ -56,6 +57,7 @@ namespace Akeno {
         res->writeHeader("Access-Control-Allow-Methods", "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS");
         res->end(std::string("{\"error\":\"").append(escapeString(message)).append("\",\"code\":").append(std::to_string(code)).append(",\"success\":false}"));
     }
+#endif
 
     template <bool SSL>
     void sendJSON(uWS::HttpResponse<SSL> *res, std::string_view json) {
@@ -71,6 +73,7 @@ namespace Akeno {
     }
 
     // For HTTP/3, we have to use writeHeader instead of writeRaw
+#ifndef UWS_NO_HTTP3
     void sendJSON(uWS::Http3Response *res, std::string_view json) {
         res->writeStatus(uWS::HTTP_200_OK);
         // TODO: Move CORS headers to a better place
@@ -80,4 +83,5 @@ namespace Akeno {
         res->writeHeader("Access-Control-Allow-Methods", "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS");
         res->end(json);
     }
+#endif
 }
