@@ -35,7 +35,9 @@
 #include "libdeflate.h"
 
 // Brotli compression
+#ifndef UWS_NO_BROTLI
 #include <brotli/encode.h>
+#endif
 
 using namespace std::literals;
 
@@ -66,9 +68,12 @@ uint8_t getUsedCompression(std::string_view acceptEncoding, std::string_view mim
         }
     }
 
-    if (acceptEncoding.find("br") != std::string_view::npos) {
+	#ifndef UWS_NO_BROTLI
+	if (acceptEncoding.find("br") != std::string_view::npos) {
         return CompressionVariant::BROTLI;
-    } else if (acceptEncoding.find("gzip") != std::string_view::npos) {
+	} else
+	#endif
+	if (acceptEncoding.find("gzip") != std::string_view::npos) {
         return CompressionVariant::GZIP;
     } else if (acceptEncoding.find("deflate") != std::string_view::npos) {
         return CompressionVariant::DEFLATE;
@@ -578,6 +583,9 @@ public:
 			compressed.resize(actualSize);
 
 		} else if (variant == CompressionVariant::BROTLI) {
+			#ifdef UWS_NO_BROTLI
+			return nullptr;
+			#else
 			size_t bound = BrotliEncoderMaxCompressedSize(base.buffer.size());
 			if (bound == 0) {
 				return nullptr;
@@ -598,6 +606,7 @@ public:
 				return nullptr;
 			}
 			compressed.resize(actualSize);
+			#endif
 
 		} else if (variant == CompressionVariant::DEFLATE) {
 			struct libdeflate_compressor *compressor = libdeflate_alloc_compressor(6);
