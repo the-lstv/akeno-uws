@@ -36,6 +36,7 @@
 #include "akeno/DomainHandler.h"
 
 #include <string_view>
+#include <cstring>
 #include <iostream>
 #include "MoveOnlyFunction.h"
 
@@ -83,9 +84,23 @@ private:
 
     HttpContext<SSL> *init() {
         /* Handle socket connections */
-        us_socket_context_on_open(SSL, getSocketContext(), [](us_socket_t *s, int, char *, int) {
+        us_socket_context_on_open(SSL, getSocketContext(), [](us_socket_t *s, int, char *ip, int ip_length) {
             us_socket_timeout(SSL, s, HTTP_IDLE_TIMEOUT_S);
             new (us_socket_ext(SSL, s)) HttpResponseData<SSL>;
+
+#ifdef UWS_REMOTE_ADDRESS_USERSPACE
+            /* Copy remote address into per-socket cache for later retrieval */
+            AsyncSocketData<SSL> *asyncSocketData = (AsyncSocketData<SSL> *) us_socket_ext(SSL, s);
+            if (ip_length > 0 && ip_length <= 16) {
+                memcpy(asyncSocketData->remoteAddress, ip, (size_t) ip_length);
+                asyncSocketData->remoteAddressLength = ip_length;
+            } else {
+                asyncSocketData->remoteAddressLength = 0;
+            }
+#else
+            (void) ip;
+            (void) ip_length;
+#endif
 
             HttpContextData<SSL> *httpContextData = getSocketContextDataS(s);
             for (auto &f : httpContextData->filterHandlers) {
@@ -241,9 +256,9 @@ private:
 
                 return s;
 
-            }, [httpResponseData](void *user, std::string_view data, bool fin) -> void * {
+            }, [httpResponseData](void *user, std::string_view data, uint64_t maxRemainingBodyLength) -> void * {
                 if (httpResponseData->inStream) {
-                    if (fin) {
+                    if (maxRemainingBodyLength == 0) {
                         us_socket_timeout(SSL, (struct us_socket_t *) user, 0);
                     } else {
                         httpResponseData->received_bytes_per_timeout += (unsigned int) data.length();
@@ -253,7 +268,7 @@ private:
                         }
                     }
 
-                    httpResponseData->inStream(data, fin);
+                    httpResponseData->inStream(data, maxRemainingBodyLength);
 
                     if (us_socket_is_closed(SSL, (struct us_socket_t *) user)) {
                         return nullptr;
@@ -263,7 +278,7 @@ private:
                         return nullptr;
                     }
 
-                    if (fin) {
+                    if (maxRemainingBodyLength == 0) {
                         httpResponseData->inStream = nullptr;
                     }
                 }

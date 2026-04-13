@@ -598,6 +598,17 @@ public:
 
     TemplatedProtocol(const TemplatedProtocol &other) = delete;
 
+    TemplatedProtocol &operator=(const TemplatedProtocol &) = delete;
+
+    TemplatedProtocol &operator=(TemplatedProtocol &&other) {
+        std::swap(this->httpContext, other.httpContext);
+        std::swap(this->app, other.app);
+        std::swap(this->sniServerNames, other.sniServerNames);
+        std::swap(this->webSocketContextDeleters, other.webSocketContextDeleters);
+        std::swap(this->webSocketContexts, other.webSocketContexts);
+        return *this;
+    }
+
     TemplatedProtocol(TemplatedProtocol &&other) {
         httpContext = other.httpContext;
         other.httpContext = nullptr;

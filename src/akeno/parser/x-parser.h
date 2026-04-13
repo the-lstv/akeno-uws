@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <stack>
 #include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
 #include <functional>
 #include <memory>
@@ -444,6 +445,9 @@ public:
             while (!tagStack.empty()) {
                 options.onClosingTag(*output, tagStack, tagStack.top(), userData);
                 tagStack.pop();
+                if (!attributeStack.empty()) {
+                    attributeStack.pop_back();
+                }
             }
         }
 
@@ -677,7 +681,7 @@ public:
                                     pushText(*output);
                                     output->append("<hr>");
                                     it = p; 
-                                    value_start = it;
+                                    value_start = it + 1;
                                     continue;
                                 }
                             }
@@ -829,6 +833,36 @@ public:
                             break; 
                         }
 
+                        // Inline code with variable backtick count (`...`, ``...`` etc.)
+                        if (*it == '`') {
+                            size_t tickCount = 1;
+                            while ((it + tickCount) < chunk_end && it[tickCount] == '`') {
+                                tickCount++;
+                            }
+
+                            if (md_inline_code_ticks == 0) {
+                                pushText(*output);
+                                output->append("<code>");
+                                md_inline_code_ticks = tickCount;
+                                it += tickCount - 1;
+                                value_start = it + 1;
+                                continue;
+                            }
+
+                            if (tickCount == md_inline_code_ticks) {
+                                pushText(*output);
+                                output->append("</code>");
+                                md_inline_code_ticks = 0;
+                                it += tickCount - 1;
+                                value_start = it + 1;
+                                continue;
+                            }
+                        }
+
+                        if (md_inline_code_ticks > 0) {
+                            break;
+                        }
+
                         // Headers
                         if (md_state == MD_NONE && atLineStart && *it == '#') {
                             int level = 0;
@@ -939,7 +973,7 @@ public:
                         }
 
                         // Blockquotes
-                        if (atLineStart && *it == '>' && (it + 1) < chunk_end && it[1] == ' ') {
+                        if (atLineStart && *it == '>') {
                             pushText(*output);
                             if (!md_in_quote) {
                                 output->append("<blockquote>");
@@ -947,7 +981,11 @@ public:
                             } else {
                                 output->append("<br>");
                             }
-                            it += 1;
+
+                            if ((it + 1) < chunk_end && it[1] == ' ') {
+                                it += 1;
+                            }
+
                             value_start = it + 1;
                             continue;
                         }
@@ -955,7 +993,7 @@ public:
                         // Newline handling for closing block structures
                         if (*it == '\n') {
                             if (md_state == MD_HEADER) {
-                                pushText(*output);
+                                pushMarkdownHeaderText(*output, it);
                                 output->append("</h").append(std::to_string(md_heading_level)).append(">");
                                 md_state = MD_NONE;
                                 md_heading_level = 0;
@@ -997,7 +1035,7 @@ public:
                                             md_list_item_open_stack.pop_back();
                                         }
                                     }
-                                    value_start = it; 
+                                    value_start = it + 1; 
                                 } else {
                                     int setIndent = md_list_stack.back().first;
                                     if (nextIndent <= setIndent) {
@@ -1006,7 +1044,7 @@ public:
                                         if (!md_list_item_open_stack.empty()) {
                                             md_list_item_open_stack.back() = 0;
                                         }
-                                        value_start = it;
+                                        value_start = it + 1;
                                     } else {
                                         pushText(*output);
                                         value_start = it + 1;
@@ -1032,13 +1070,18 @@ public:
                             } else if (md_in_quote) {
                                 bool nextIsQuote = false;
                                 if ((it + 1) < chunk_end) {
-                                    if (*(it + 1) == '>' && (it + 2) < chunk_end && *(it+2) == ' ') nextIsQuote = true;
+                                    if (*(it + 1) == '>') {
+                                        const char* nextChar = it + 2;
+                                        if (nextChar >= chunk_end || *nextChar == ' ' || *nextChar == '\n' || *nextChar == '\r') {
+                                            nextIsQuote = true;
+                                        }
+                                    }
                                 }
                                 if(!nextIsQuote) {
                                     pushText(*output);
                                     output->append("</blockquote>");
                                     md_in_quote = false;
-                                    value_start = it;
+                                    value_start = it + 1;
                                 }
                             }
                         }
@@ -1058,6 +1101,16 @@ public:
                             pushText(*output);
                             output->append(md_fmt_strikethrough ? "</s>" : "<s>");
                             md_fmt_strikethrough = !md_fmt_strikethrough;
+                            it += 1;
+                            value_start = it + 1;
+                            continue;
+                        }
+
+                        // Highlight ==text==
+                        if (*it == '=' && (it + 1) < chunk_end && it[1] == '=') {
+                            pushText(*output);
+                            output->append(md_fmt_highlight ? "</mark>" : "<mark>");
+                            md_fmt_highlight = !md_fmt_highlight;
                             it += 1;
                             value_start = it + 1;
                             continue;
@@ -1082,15 +1135,6 @@ public:
                             continue;
                         }
                         
-                        // Inline Code `
-                        if (*it == '`') {
-                            pushText(*output);
-                            output->append(md_fmt_code ? "</code>" : "<code>");
-                            md_fmt_code = !md_fmt_code;
-                            value_start = it + 1;
-                            continue;
-                        }
-
                         // Images ![]() and Links []()
                         bool isImage = (*it == '!' && (it + 1) < chunk_end && it[1] == '[');
                         if (isImage || *it == '[') {
@@ -1180,6 +1224,9 @@ public:
                                 pushText(*output);
 
                                 tagStack.pop();
+                                if (!attributeStack.empty()) {
+                                    attributeStack.pop_back();
+                                }
                                 
                                 bool parent_markdown = false;
                                 if(!markdownStack.empty()) {
@@ -1225,6 +1272,7 @@ public:
                         if(!end_tag) {
                             // Handle opening tags
                             std::string_view tag(value_start, it - value_start);
+                            current_tag_name.assign(tag.data(), tag.size());
 
                             bool prev_markdown = in_markdown;
 
@@ -1285,6 +1333,7 @@ public:
 
                             if(render_element && voidElements.find(std::string(tag)) == voidElements.end()) {
                                 tagStack.push(tag);
+                                attributeStack.emplace_back();
                                 markdownStack.push(prev_markdown);
                                 
                                 if(tag == "head") {
@@ -1340,6 +1389,9 @@ public:
                         }
 
                         tagStack.pop();
+                        if (!attributeStack.empty()) {
+                            attributeStack.pop_back();
+                        }
                         
                         if (options.onClosingTag) {
                             options.onClosingTag(*output, tagStack, closingTag, userData);
@@ -1392,11 +1444,11 @@ public:
                         if(it > value_start){
                             std::string_view attribute_view(value_start, it - value_start);
                             current_attr_name = std::string(attribute_view);
+                            current_attr_name_lower = toLowerCopy(attribute_view);
 
                             bool allowed = true;
                             if (sanitize_html) {
-                                std::string attrLower = current_attr_name;
-                                std::transform(attrLower.begin(), attrLower.end(), attrLower.begin(), ::tolower);
+                                std::string attrLower = current_attr_name_lower;
                                 if (allowedAttributes.find(attrLower) == allowedAttributes.end()) {
                                     allowed = false;
                                 }
@@ -1409,7 +1461,7 @@ public:
                                 break;
                             }
 
-                            if(!options.vanilla && attribute_view == "markdown") {
+                            if(!options.vanilla && current_attr_name_lower == "markdown") {
                                 in_markdown = true;
                                 pending_markdown_attr = true;
                             }
@@ -1418,12 +1470,16 @@ public:
                                 pending_import_attr = true;
                             }
 
-                            if (pending_markdown_attr && attribute_view == "markdown" && *it != '=') {
+                            if (pending_markdown_attr && current_attr_name_lower == "markdown" && *it != '=') {
                                 pending_markdown_attr = false;
                             }
 
                             if (pending_import_attr && attribute_view == "@import" && *it != '=') {
                                 pending_import_attr = false;
+                            }
+
+                            if (*it != '=' && !current_attr_name_lower.empty() && current_attr_allowed && !attributeStack.empty()) {
+                                attributeStack.back()[current_attr_name_lower] = "";
                             }
 
                             if (ls_template_tag) {
@@ -1438,7 +1494,7 @@ public:
                                     output->append(" id=\"");
                                     output->append(attribute_view.substr(1));
                                     output->append("\"");
-                                } else if (!options.vanilla && (attribute_view == "markdown" || (attribute_view == "@import" && options.enableImport))) {
+                                } else if (!options.vanilla && (current_attr_name_lower == "markdown" || (attribute_view == "@import" && options.enableImport))) {
                                     // Do nothing
                                 } else if (!options.vanilla && attribute_view[0] == '.') {
                                     if(!class_buffer.empty()) {
@@ -1448,7 +1504,7 @@ public:
                                     std::string attribute_str(attribute_view.substr(1));
                                     std::replace(attribute_str.begin(), attribute_str.end(), '.', ' ');
                                     class_buffer.append(attribute_str);
-                                } else if (!options.vanilla && attribute_view == "class") {
+                                } else if (!options.vanilla && current_attr_name_lower == "class") {
                                     flag_appendToClass = true;
                                 } else {
                                     output->append(" ");
@@ -1501,6 +1557,9 @@ public:
                             if (options.onClosingTag && !tagStack.empty()) {
                                 options.onClosingTag(*output, tagStack, tagStack.top(), userData);
                                 tagStack.pop();
+                                if (!attributeStack.empty()) {
+                                    attributeStack.pop_back();
+                                }
 
                                 bool parent_markdown = false;
                                 if(!markdownStack.empty()) {
@@ -1556,8 +1615,10 @@ public:
                                     if(!currentFilePath.empty()) p = std::filesystem::path(currentFilePath).parent_path();
                                     
                                     p /= value;
+                                    p = p.lexically_normal();
                                     std::cout << "Importing file: " << p.string() << std::endl;
                                     pending_import_file = p.string();
+                                    pending_import_script = (toLowerCopy(current_tag_name) == "script");
                                 }
                                 pending_import_attr = false;
                             } else if (ls_template_tag) {
@@ -1571,8 +1632,15 @@ public:
                                 }
 
                                 class_buffer.append(value);
+                                if (!attributeStack.empty()) {
+                                    attributeStack.back()["class"] = class_buffer;
+                                }
                                 flag_appendToClass = false;
                             } else {
+                                if (!current_attr_name_lower.empty() && current_attr_allowed && !attributeStack.empty()) {
+                                    attributeStack.back()[current_attr_name_lower] = std::string(value);
+                                }
+
                                 char quote = value.find('\'') != std::string_view::npos ? '"' : '\'';
 
                                 output->append("=");
@@ -1693,7 +1761,11 @@ public:
         }
 
         if(state == TEXT) {
-            pushText(*output);
+            if (in_markdown && md_state == MD_HEADER) {
+                pushMarkdownHeaderText(*output, it);
+            } else {
+                pushText(*output);
+            }
         }
 
         // if(currentTemplateChunkSplit && !inside_template_file) {
@@ -1738,6 +1810,21 @@ public:
         restorePosition(pos);
         currentFilePath = previousFilePath;
         return true;
+    }
+
+    std::string getTagAttribute(std::string_view name) const {
+        if (attributeStack.empty() || name.empty()) {
+            return "";
+        }
+
+        std::string key = toLowerCopy(name);
+        const auto &attrs = attributeStack.back();
+        auto found = attrs.find(key);
+        if (found == attrs.end()) {
+            return "";
+        }
+
+        return found->second;
     }
 
     std::stack<std::string_view> tagStack;
@@ -1819,8 +1906,13 @@ private:
     std::string ls_template_buffer;
     std::string ls_inline_script;
     std::string pending_import_file;
+    bool pending_import_script = false;
+
+    std::vector<std::unordered_map<std::string, std::string>> attributeStack;
+    std::string current_tag_name;
 
     std::string current_attr_name;
+    std::string current_attr_name_lower;
     bool current_attr_allowed = false;
 
     FileCache* activeCache() {
@@ -1839,14 +1931,18 @@ private:
         class_buffer.clear();
         body_attributes.clear();
         current_attr_name.clear();
+        current_attr_name_lower.clear();
+        current_tag_name.clear();
         current_attr_allowed = false;
         tagStack = std::stack<std::string_view>();
+        attributeStack.clear();
         markdownStack = std::stack<bool>();
         template_scope = std::string_view();
         special_modifier_type = std::string_view();
         inside_head = false;
         
         pending_import_file.clear();
+        pending_import_script = false;
 
         resetMarkdownState();
         pending_import_attr = false;
@@ -1865,9 +1961,10 @@ private:
     bool md_table_header = false;
     bool md_fmt_bold = false; 
     bool md_fmt_italic = false;
-    bool md_fmt_code = false;
+    bool md_fmt_highlight = false;
     bool md_fmt_underline = false;
     bool md_fmt_strikethrough = false;
+    size_t md_inline_code_ticks = 0;
     uint8_t md_heading_level = 0;
     bool pending_markdown_attr = false;
     bool pending_import_attr = false;
@@ -1883,19 +1980,25 @@ private:
 
     struct ParsingState {
         std::stack<std::string_view> tagStack;
+        std::vector<std::unordered_map<std::string, std::string>> attributeStack;
         std::stack<bool> markdownStack;
         std::string body_attributes;
         bool inside_head;
         bool template_enabled;
+        std::string current_tag_name;
+        std::string current_attr_name;
+        std::string current_attr_name_lower;
+        bool pending_import_script;
         
         bool in_markdown;
         bool md_in_quote;
         bool md_table_header;
         bool md_fmt_bold;
         bool md_fmt_italic;
-        bool md_fmt_code;
+        bool md_fmt_highlight;
         bool md_fmt_underline;
         bool md_fmt_strikethrough;
+        size_t md_inline_code_ticks;
         uint8_t md_heading_level;
         bool pending_markdown_attr;
         bool pending_import_attr;
@@ -1910,9 +2013,10 @@ private:
     
     ParsingState captureState() {
         return {
-            tagStack, markdownStack, body_attributes, inside_head, template_enabled,
+            tagStack, attributeStack, markdownStack, body_attributes, inside_head, template_enabled,
+            current_tag_name, current_attr_name, current_attr_name_lower, pending_import_script,
             in_markdown, md_in_quote, md_table_header,
-            md_fmt_bold, md_fmt_italic, md_fmt_code, md_fmt_underline, md_fmt_strikethrough,
+            md_fmt_bold, md_fmt_italic, md_fmt_highlight, md_fmt_underline, md_fmt_strikethrough, md_inline_code_ticks,
             md_heading_level, pending_markdown_attr, pending_import_attr, md_base_indent, md_state,
             md_list_stack, md_table_alignments, md_table_col_index, md_list_item_open_stack, markdown_tag_stack
         };
@@ -1920,19 +2024,25 @@ private:
     
     void restoreState(const ParsingState& s) {
         tagStack = s.tagStack;
+        attributeStack = s.attributeStack;
         markdownStack = s.markdownStack;
         body_attributes = s.body_attributes;
         inside_head = s.inside_head;
         template_enabled = s.template_enabled;
+        current_tag_name = s.current_tag_name;
+        current_attr_name = s.current_attr_name;
+        current_attr_name_lower = s.current_attr_name_lower;
+        pending_import_script = s.pending_import_script;
         
         in_markdown = s.in_markdown;
         md_in_quote = s.md_in_quote;
         md_table_header = s.md_table_header;
         md_fmt_bold = s.md_fmt_bold;
         md_fmt_italic = s.md_fmt_italic;
-        md_fmt_code = s.md_fmt_code;
+        md_fmt_highlight = s.md_fmt_highlight;
         md_fmt_underline = s.md_fmt_underline;
         md_fmt_strikethrough = s.md_fmt_strikethrough;
+        md_inline_code_ticks = s.md_inline_code_ticks;
         md_heading_level = s.md_heading_level;
         pending_markdown_attr = s.pending_markdown_attr;
         pending_import_attr = s.pending_import_attr;
@@ -1959,9 +2069,10 @@ private:
         
         md_fmt_bold = false;
         md_fmt_italic = false;
-        md_fmt_code = false;
+        md_fmt_highlight = false;
         md_fmt_underline = false;
         md_fmt_strikethrough = false;
+        md_inline_code_ticks = 0;
         md_in_quote = false;
     }
 
@@ -2005,9 +2116,14 @@ private:
             md_in_quote = false;
         }
 
-        if (md_fmt_code) {
+        if (md_inline_code_ticks > 0) {
             output->append("</code>");
-            md_fmt_code = false;
+            md_inline_code_ticks = 0;
+        }
+
+        if (md_fmt_highlight) {
+            output->append("</mark>");
+            md_fmt_highlight = false;
         }
 
         if (md_fmt_italic) {
@@ -2040,6 +2156,63 @@ private:
                 options.onText(buffer, tagStack, text, userData);
             }
         }
+    }
+
+    void pushMarkdownHeaderText(std::string &buffer, const char *endPtr) {
+        if (!options.onText || !endPtr || endPtr <= value_start) {
+            return;
+        }
+
+        std::string_view text(value_start, endPtr - value_start);
+        text = rtrim(text);
+
+        while (!text.empty() && text.back() == '#') {
+            text.remove_suffix(1);
+            text = rtrim(text);
+        }
+
+        if (!text.empty()) {
+            options.onText(buffer, tagStack, text, userData);
+        }
+    }
+
+    static std::string toLowerCopy(std::string_view value) {
+        std::string lowered(value);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return lowered;
+    }
+
+    bool importFileContent(const std::string &filePath, bool parseAsMarkup) {
+        if (parseAsMarkup) {
+            return inlineFile(filePath);
+        }
+
+        std::ifstream file(filePath, std::ios::in | std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            lastError = "Failed to open file: " + filePath;
+            return false;
+        }
+
+        std::streamsize size = file.tellg();
+        if (size > MAX_FILE_SIZE) {
+            lastError = "File size exceeds maximum allowed size: " + filePath;
+            return false;
+        }
+
+        file.seekg(0, std::ios::beg);
+        std::string content(static_cast<size_t>(size), '\0');
+        if (size > 0 && !file.read(content.data(), size)) {
+            lastError = "Failed to read file: " + filePath;
+            return false;
+        }
+
+        if (output) {
+            output->append(content);
+        }
+        trackDependency(filePath);
+        return true;
     }
 
     void _endTag() {
@@ -2081,9 +2254,13 @@ private:
 
         if(!pending_import_file.empty()) {
             std::string file = pending_import_file;
+            bool importScriptRaw = pending_import_script;
             pending_import_file.clear(); // Clear it before recursion
-            
-            inlineFile(file);
+            pending_import_script = false;
+
+            if (!importFileContent(file, !importScriptRaw)) {
+                std::cerr << "Error importing file: " << lastError << std::endl;
+            }
         }
     }
 
