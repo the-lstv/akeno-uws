@@ -255,82 +255,45 @@ public:
         return cache->hasChanged(filePath);
     }
 
-    // TODO: This *needs* a better implementation
     std::string exportCopy(const FileCache::CacheEntry* cacheEntry) {
         if (!cacheEntry) return "";
         FileCache* cache = activeCache();
         if (!cache) return "";
 
-        // If no template, just wrap the (possibly trimmed) file content
-        if (!cacheEntry->shared || cacheEntry->shared->templatePath.empty()) {
-            return "<!DOCTYPE html>\n" + options.header + "\n<html lang=\"en\">" + cacheEntry->buffer + "</html>";
-        }
+        std::string mergedContent = cacheEntry->buffer;
+        std::string templatePath = cacheEntry->shared ? cacheEntry->shared->templatePath : "";
+        std::unordered_set<std::string> visitedTemplates;
 
-        const FileCache::CacheEntry* templateEntry = cache->get(cacheEntry->shared->templatePath, 0);
-        if (!templateEntry) {
-            return "<!DOCTYPE html>\n" + options.header + "\n<html lang=\"en\">" + cacheEntry->buffer + "</html>";
-        }
+        while (!templatePath.empty()) {
+            templatePath = std::filesystem::path(templatePath).lexically_normal().string();
 
-        // 1. Extract and remove the file's <head>…</head> content
-        std::string fileContent = cacheEntry->buffer;
-        std::string fileHeadInner;
-        size_t fileHeadOpen = fileContent.find("<head>");
-        size_t fileHeadClose = fileContent.find("</head>");
-        if (fileHeadOpen != std::string::npos && fileHeadClose != std::string::npos && fileHeadClose > fileHeadOpen) {
-            size_t innerStart = fileHeadOpen + 6; // after "<head>"
-            fileHeadInner = fileContent.substr(innerStart, fileHeadClose - innerStart);
-            fileContent.erase(fileHeadOpen, fileHeadClose + 7 - fileHeadOpen); // remove "<head>…</head>"
-        }
+            if (!visitedTemplates.insert(templatePath).second) {
+                lastError = "Template cycle detected while exporting: " + templatePath;
+                break;
+            }
 
-        // 2. Merge extracted head into the template's <head>
-        std::string combinedTemplateContent = templateEntry->buffer;
+            const FileCache::CacheEntry* templateEntry = cache->get(templatePath, 0);
+            if (!templateEntry) {
+                break;
+            }
 
-        size_t tmplHeadOpen2 = std::string::npos;
-        size_t tmplHeadClose2 = std::string::npos;
-        if (!fileHeadInner.empty()) {
-            tmplHeadOpen2 = combinedTemplateContent.find("<head>");
-            tmplHeadClose2 = combinedTemplateContent.find("</head>");
-            if (tmplHeadOpen2 != std::string::npos && tmplHeadClose2 != std::string::npos && tmplHeadClose2 > tmplHeadOpen2) {
-                combinedTemplateContent.insert(tmplHeadClose2, fileHeadInner);
+            mergedContent = applyTemplateLayer(templateEntry, std::move(mergedContent));
+
+            if (templateEntry->shared) {
+                templatePath = templateEntry->shared->templatePath;
+            } else {
+                templatePath.clear();
             }
         }
 
-        // 3. Build result, adjusting split if head insert was before it
-        const size_t origSplit = templateEntry->shared ? templateEntry->shared->templateChunkSplit : 0;
-        const bool hasSplit = origSplit > 0;
-        size_t splitPoint = origSplit;
-        if (tmplHeadClose2 != std::string::npos && tmplHeadClose2 < origSplit) {
-            splitPoint += fileHeadInner.size();
-        }
-
-        const size_t tmplLen = combinedTemplateContent.size();
-        size_t resultSize = fileContent.size() + options.header.size() + 15;
-        if (hasSplit) {
-            resultSize += splitPoint;
-            resultSize += tmplLen - splitPoint;
-        } else {
-            resultSize += tmplLen;
-        }
-
         std::string result = "<!DOCTYPE html>\n" + options.header + "\n<html lang=\"en\">";
-        result.reserve(resultSize);
-
-        if (hasSplit) {
-            result.append(combinedTemplateContent, 0, splitPoint);
-        } else {
-            result.append(combinedTemplateContent);
-        }
-
-        result.append(fileContent);
-
-        if (hasSplit) {
-            result.append(combinedTemplateContent, splitPoint, tmplLen - splitPoint);
-        }
-
-        return result + "</html>";
+        result.reserve(result.size() + mergedContent.size() + 7);
+        result.append(mergedContent);
+        result.append("</html>");
+        return result;
     }
 
-    FileCache::CacheEntry* fromFile(std::string filePath, void* userData = nullptr, std::string rootPath = "", bool checkCache = true) {
+    FileCache::CacheEntry* fromFile(std::string filePath, void* userData = nullptr, std::string rootPath = "", bool checkCache = true, std::string explicitTemplatePath = "") {
         filePath = std::filesystem::path(filePath).lexically_normal().string();
         FileCache* cache = activeCache();
         if (!cache) {
@@ -351,6 +314,22 @@ public:
                 return cachedEntry;
             }
         }
+
+        if (std::find(parsingFileStack.begin(), parsingFileStack.end(), filePath) != parsingFileStack.end()) {
+            lastError = "Template recursion detected: " + filePath;
+            return nullptr;
+        }
+
+        struct ParsingFileGuard {
+            std::vector<std::string>& stack;
+            explicit ParsingFileGuard(std::vector<std::string>& stack, const std::string& file)
+                : stack(stack) {
+                stack.push_back(file);
+            }
+            ~ParsingFileGuard() {
+                stack.pop_back();
+            }
+        } parsingGuard(parsingFileStack, filePath);
 
         std::ifstream file(filePath, std::ios::in | std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
@@ -402,17 +381,26 @@ public:
         std::string previousTemplatePath = currentTemplatePath;
         size_t previousTemplateChunkSplit = currentTemplateChunkSplit;
         std::string previousFilePath = currentFilePath;
+        std::string previousTemplateOverride = activeTemplateOverride;
 
         activeDependencies = &dependencies;
         currentTemplatePath.clear();
         currentTemplateChunkSplit = 0;
         currentFilePath = filePath;
+        activeTemplateOverride = resolveTemplatePath(explicitTemplatePath);
 
         resume();
         end();
 
+        if (!activeTemplateOverride.empty()) {
+            if (!applyTemplateReference(activeTemplateOverride, userData)) {
+                std::cerr << "Error accessing template file: " << lastError << std::endl;
+            }
+        }
+
         activeDependencies = previousDependencies;
         currentFilePath = previousFilePath;
+        activeTemplateOverride = previousTemplateOverride;
 
         FileCache::CacheEntry* updatedEntry = cache->update(filePath, std::move(parsedContent), dependencies);
         if (!updatedEntry) {
@@ -647,10 +635,9 @@ public:
                             }
 
                             if (md_base_indent > 0) {
-                                pushText(*output);
-                                
                                 int skip = (currentIndent < md_base_indent) ? currentIndent : md_base_indent;
                                 if (skip > 0) {
+                                    pushText(*output);
                                     it += skip - 1;
                                     value_start = it + 1;
                                     md_just_consumed_indent = true;
@@ -1584,6 +1571,37 @@ public:
                 }
 
                 case ATTRIBUTE_VALUE: {
+                    if (!render_element && !ls_template_tag) {
+                        bool end = *it == '>' || std::isspace(static_cast<unsigned char>(*it));
+
+                        if(*it == '"' || *it == '\''){
+                            if(string_char == 0) {
+                                value_start = it + 1;
+                                string_char = *it;
+                                break;
+                            }
+
+                            string_char = 0;
+                            end = true;
+                        }
+
+                        if (end) {
+                            if(*it == '>') {
+                                if (it < chunk_end) {
+                                    value_start = it + 1;
+                                }
+                                _endTag();
+                                continue;
+                            }
+
+                            state = ATTRIBUTE;
+                            value_start = it + 1;
+                            space_broken = false;
+                        }
+
+                        break;
+                    }
+
                     bool end = *it == '>' || std::isspace(static_cast<unsigned char>(*it));
 
                     if(*it == '"' || *it == '\''){
@@ -1723,34 +1741,10 @@ public:
                         value_start = it + 1;
 
                         if(special_modifier_type == "template") {
-                            if (template_enabled && !modifierValue.empty()) {
-                                std::string templateFile = std::filesystem::path(rootPath + std::string(modifierValue)).lexically_normal().string();
-    
-                                ParsingState oldState = captureState();
-                                ____xParser____HTMLParsingPosition originalPosition = storePosition();
-
-                                FileCache::CacheEntry* templateCacheEntry = fromFile(templateFile, userData, rootPath);
-
-                                restorePosition(originalPosition);
-                                restoreState(oldState);
-
-                                // This has to be set; somehow it isn't by default
-                                // cacheEntry->shared->templatePath = templateFile;
-                                
-                                if (templateCacheEntry) {
-                                    currentTemplatePath = templateFile;
-                                    trackDependency(templateFile);
-                                    trackDependenciesFromEntry(templateCacheEntry);
-                                } else {
+                            if (activeTemplateOverride.empty() && template_enabled && !modifierValue.empty()) {
+                                if (!applyTemplateReference(modifierValue, userData)) {
                                     std::cerr << "Error accessing template file: " << lastError << std::endl;
                                 }
-    
-                                // if (cacheEntry->templateChunkSplit > 0) {
-                                //     output->append(cacheEntry->content, 0, cacheEntry->templateChunkSplit);
-                                // } else {
-                                //     // Otherwise, append the whole content
-                                //     output->append(cacheEntry->content);
-                                // }
                             }
                         }
 
@@ -1861,9 +1855,11 @@ private:
     FileCache ownedCache;
     FileCache* cacheStore = &ownedCache;
     std::vector<std::string>* activeDependencies = nullptr;
+    std::vector<std::string> parsingFileStack;
     std::string currentTemplatePath;
     size_t currentTemplateChunkSplit = 0;
     std::string currentFilePath;
+    std::string activeTemplateOverride;
 
     FileCache::CacheEntry* cacheEntry = nullptr;
 
@@ -2182,6 +2178,123 @@ private:
             return static_cast<char>(std::tolower(c));
         });
         return lowered;
+    }
+
+    std::string applyTemplateLayer(const FileCache::CacheEntry *templateEntry, std::string content) {
+        if (!templateEntry) {
+            return content;
+        }
+
+        std::string templateContent = templateEntry->buffer;
+        const size_t originalSplit = templateEntry->shared ? templateEntry->shared->templateChunkSplit : 0;
+        size_t splitPoint = originalSplit;
+
+        if (splitPoint > templateContent.size()) {
+            splitPoint = templateContent.size();
+        }
+
+        size_t templateHeadOpen = templateContent.find("<head>");
+        size_t templateHeadClose = templateContent.find("</head>");
+        bool templateHasHead = templateHeadOpen != std::string::npos && templateHeadClose != std::string::npos && templateHeadClose > templateHeadOpen;
+
+        if (templateHasHead) {
+            size_t contentHeadOpen = content.find("<head>");
+            size_t contentHeadClose = content.find("</head>");
+            if (contentHeadOpen != std::string::npos && contentHeadClose != std::string::npos && contentHeadClose > contentHeadOpen) {
+                const size_t innerStart = contentHeadOpen + 6;
+                std::string headInner = content.substr(innerStart, contentHeadClose - innerStart);
+                content.erase(contentHeadOpen, contentHeadClose + 7 - contentHeadOpen);
+
+                if (!headInner.empty()) {
+                    templateContent.insert(templateHeadClose, headInner);
+                    if (templateHeadClose < splitPoint) {
+                        splitPoint += headInner.size();
+                    }
+                }
+            }
+        }
+
+        if (splitPoint > templateContent.size()) {
+            splitPoint = templateContent.size();
+        }
+
+        const bool hasSplit = originalSplit > 0;
+        std::string result;
+        result.reserve(templateContent.size() + content.size());
+
+        if (hasSplit) {
+            result.append(templateContent, 0, splitPoint);
+            result.append(content);
+            result.append(templateContent, splitPoint, templateContent.size() - splitPoint);
+        } else {
+            result.append(templateContent);
+            result.append(content);
+        }
+
+        return result;
+    }
+
+    std::string resolveTemplatePath(std::string_view templateRef) const {
+        if (templateRef.empty()) {
+            return "";
+        }
+
+        std::string_view ref = templateRef;
+        while (!ref.empty() && std::isspace(static_cast<unsigned char>(ref.front()))) {
+            ref.remove_prefix(1);
+        }
+        while (!ref.empty() && std::isspace(static_cast<unsigned char>(ref.back()))) {
+            ref.remove_suffix(1);
+        }
+
+        if (ref.empty()) {
+            return "";
+        }
+
+        if (!rootPath.empty() && ref.front() == '/' && (ref.size() == 1 || ref[1] != '/')) {
+            std::filesystem::path root(rootPath);
+            std::filesystem::path relative(std::string(ref.substr(1)));
+            return (root / relative).lexically_normal().string();
+        }
+
+        std::filesystem::path path(ref);
+        if (!path.is_absolute()) {
+            if (!currentFilePath.empty()) {
+                path = std::filesystem::path(currentFilePath).parent_path() / path;
+            } else if (!rootPath.empty()) {
+                path = std::filesystem::path(rootPath) / path;
+            }
+        }
+
+        return path.lexically_normal().string();
+    }
+
+    bool applyTemplateReference(std::string_view templateRef, void* callbackUserData) {
+        if (templateRef.empty()) {
+            return false;
+        }
+
+        std::string templateFile = resolveTemplatePath(templateRef);
+        if (templateFile.empty()) {
+            return false;
+        }
+
+        ParsingState oldState = captureState();
+        ____xParser____HTMLParsingPosition originalPosition = storePosition();
+
+        FileCache::CacheEntry* templateCacheEntry = fromFile(templateFile, callbackUserData, rootPath);
+
+        restorePosition(originalPosition);
+        restoreState(oldState);
+
+        if (!templateCacheEntry) {
+            return false;
+        }
+
+        currentTemplatePath = templateFile;
+        trackDependency(templateFile);
+        trackDependenciesFromEntry(templateCacheEntry);
+        return true;
     }
 
     bool importFileContent(const std::string &filePath, bool parseAsMarkup) {

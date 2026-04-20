@@ -321,7 +321,8 @@ namespace Akeno
 
             // There's a lot left to implement
 
-            std::string_view url = req->getUrl();
+            std::string urlStorage = std::string(req->getUrl());
+            std::string_view url = urlStorage;
             std::string_view status = "200 OK"sv;
 
             PathAttributes* attributes = app->pathAttributes.match(url);
@@ -350,7 +351,13 @@ namespace Akeno
 
                 // Handle alias
                 if (attributes->transformType == 1) { // Alias
-                    url = attributes->transformTarget;
+                    std::string target = attributes->transformTarget;
+                    size_t pos = target.find("{{url}}");
+                    if (pos != std::string::npos) {
+                        target.replace(pos, 7, url);
+                    }
+                    urlStorage = std::move(target);
+                    url = urlStorage;
                 }
             }
 
@@ -447,12 +454,12 @@ namespace Akeno
             // If not changed and is cached, we serve from cache:
             const Akeno::FileCache::CacheEntry* baseEntry = app->fileCache.get(file, 0);
 
-            if(baseEntry) {
-                std::cout << "Connected paths to key \"" << file << "\":" << std::endl;
-                for (const auto &item : baseEntry->shared->paths) {
-                    std::cout << "  " << item.path << std::endl;
-                }
-            }
+            // if(baseEntry) {
+            //     std::cout << "Connected paths to key \"" << file << "\":" << std::endl;
+            //     for (const auto &item : baseEntry->shared->paths) {
+            //         std::cout << "  " << item.path << std::endl;
+            //     }
+            // }
 
             if(baseEntry && !app->fileCache.hasChanged(file)) {
                 // Check ETag
@@ -479,6 +486,8 @@ namespace Akeno
             }
 
             // std::cout << "File \"" << file << "\" is not cached or has changed, updating cache..." << std::endl;
+
+            std::cout << "Serving file: " << file << " (mimeType: " << mimeType << ", variant: " << variant << ")\n- Aliased URL: " << url << std::endl;
 
             if constexpr (SSL) {
                 if (app->fileProcessorHttps && app->fileProcessorHttps(res, req, url, file, mimeType, variant, status)) {
