@@ -1821,6 +1821,10 @@ public:
         return found->second;
     }
 
+    int getMarkdownState() const {
+        return static_cast<int>(md_state);
+    }
+
     std::stack<std::string_view> tagStack;
     std::stack<bool> markdownStack;
     // std::stack<____xParser____HTMLParsingPosition> tree;
@@ -2144,12 +2148,33 @@ private:
     }
 
     void pushText(std::string& buffer) {
-        if(options.onText && !(it - value_start == 0)){
-            std::string_view text(value_start, it - value_start);
-            text = (!options.compact && !inside_head)? text: trim(text, true);
+        if (!options.onText || !(it - value_start == 0)) {
+            if (options.onText) {
+                std::string_view text(value_start, it - value_start);
+                const bool markdownCodeContext = md_state == MD_CODEBLOCK || md_inline_code_ticks > 0;
 
-            if(text.size() > 0) {
-                options.onText(buffer, tagStack, text, userData);
+                if (markdownCodeContext) {
+                    std::stack<std::string_view> textStack = tagStack;
+
+                    if (md_state == MD_CODEBLOCK) {
+                        textStack.push("pre");
+                        textStack.push("code");
+                    } else {
+                        textStack.push("code");
+                    }
+
+                    if (text.size() > 0) {
+                        options.onText(buffer, textStack, text, userData);
+                    }
+
+                    return;
+                }
+
+                text = (!options.compact && !inside_head)? text: trim(text, true);
+
+                if(text.size() > 0) {
+                    options.onText(buffer, tagStack, text, userData);
+                }
             }
         }
     }
